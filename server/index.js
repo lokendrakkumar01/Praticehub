@@ -58,7 +58,30 @@ app.post('/api/users', auth, roles('coordinator'), async (req, res) => { try { c
 
 app.get('/api/students', auth, async (req, res) => { try { const page = Math.max(1, Number(req.query.page) || 1), limit = Math.min(100, Math.max(1, Number(req.query.limit) || 25)); const q = String(req.query.q || '').trim(); const filter = { ...(q ? { $or: [{ fullName: new RegExp(escapeRegex(q), 'i') }, { rollNumber: new RegExp(escapeRegex(q), 'i') }] } : {}), ...(req.query.status ? { enrollmentStatus: req.query.status } : {}) }; if (req.user.role === 'student') filter._id = req.user.student; const [rows, total] = await Promise.all([Student.find(filter).sort({ fullName: 1 }).skip((page - 1) * limit).limit(limit).lean(), Student.countDocuments(filter)]); res.json({ rows, total, page, pages: Math.ceil(total / limit) }); } catch (e) { fail(res, e); } });
 app.post('/api/students', auth, roles('coordinator'), async (req, res) => { try { const fullName=String(req.body.fullName||'').trim(); const phone=String(req.body.phone||'').replace(/\D/g,''); if(fullName.length<2||fullName.length>120||phone.length<10||phone.length>15)return res.status(400).json({error:'Enter a full name and a phone number with 10 to 15 digits'}); const duplicate=await Student.findOne({fullName:new RegExp(`^${escapeRegex(fullName)}$`,'i'),phone,enrollmentStatus:'Active'}); if(duplicate)return res.status(409).json({error:'This student is already in the directory. They can sign in with this name and phone number.'}); const id=`ADM-${randomUUID()}`; const student=await Student.create({studentId:id,fullName,rollNumber:id,batch:'Admin-added',phone,enrollmentStatus:'Active'}); res.status(201).json(student); } catch (e) { fail(res, e); } });
-app.patch('/api/students/:id', auth, roles('coordinator'), async (req, res) => { try { const row = await Student.findByIdAndUpdate(req.params.id, req.body, { new: true, runValidators: true }); if (!row) return res.sendStatus(404); res.json(row); } catch (e) { fail(res, e); } });
+app.patch('/api/students/:id', auth, roles('coordinator'), async (req, res) => {
+  try {
+    const row = await Student.findById(req.params.id);
+    if (!row) return res.sendStatus(404);
+    const fullName = String(req.body.fullName ?? row.fullName).trim();
+    const phone = String(req.body.phone ?? row.phone ?? '').replace(/\D/g, '');
+    const enrollmentStatus = req.body.enrollmentStatus ?? row.enrollmentStatus;
+    if (fullName.length < 2 || fullName.length > 120 || phone.length < 10 || phone.length > 15) {
+      return res.status(400).json({ error: 'Enter a full name and a phone number with 10 to 15 digits' });
+    }
+    if (!['Active', 'Inactive', 'Graduated'].includes(enrollmentStatus)) {
+      return res.status(400).json({ error: 'Choose a valid student status' });
+    }
+    const duplicate = await Student.findOne({ _id: { $ne: row._id }, fullName: new RegExp(`^${escapeRegex(fullName)}$`, 'i'), phone, enrollmentStatus: 'Active' });
+    if (duplicate && enrollmentStatus === 'Active') {
+      return res.status(409).json({ error: 'Another active student already uses this name and phone number' });
+    }
+    row.fullName = fullName;
+    row.phone = phone;
+    row.enrollmentStatus = enrollmentStatus;
+    await row.save();
+    res.json(row);
+  } catch (e) { fail(res, e); }
+});
 app.post('/api/students/import', auth, roles('coordinator'), async (req, res) => { try { if (typeof req.body.csv !== 'string' || req.body.csv.length > 5_000_000) return res.status(400).json({ error: 'CSV is missing or exceeds 5 MB' }); const rows = parse(req.body.csv, { columns: true, skip_empty_lines: true, trim: true, bom: true }); const clean = rows.map(r => ({ studentId: r.studentId || r['Student ID'], fullName: r.fullName || r['Full Name'] || r.name, rollNumber: r.rollNumber || r['Roll Number'], batch: r.batch || r['Batch / Section'] || r.section, phone: String(r.phone || r.Phone || '').replace(/\D/g,''), email: r.email || r.Email || undefined, enrollmentStatus: r.enrollmentStatus || 'Active' })).filter(r => r.studentId && r.fullName && r.rollNumber); const ops = clean.map(doc => ({ updateOne: { filter: { $or: [{ studentId: doc.studentId }, { rollNumber: doc.rollNumber }] }, update: { $setOnInsert: doc }, upsert: true } })); const result = ops.length ? await Student.bulkWrite(ops, { ordered: false }) : { upsertedCount: 0, matchedCount: 0 }; res.json({ imported: result.upsertedCount, alreadyPresent: result.matchedCount, ignored: rows.length - clean.length }); } catch (e) { fail(res, e); } });
 app.get('/api/students/:id', auth, async (req, res) => { try { if (req.user.role === 'student' && req.user.student !== req.params.id) return res.sendStatus(403); const student = await Student.findById(req.params.id).lean(); if (!student) return res.sendStatus(404); const records = await PracticeRecord.find({ student: student._id, ...recordQuery }).sort({ practiceDate: -1 }).limit(300).lean(); res.json({ student, records }); } catch (e) { fail(res, e); } });
 
