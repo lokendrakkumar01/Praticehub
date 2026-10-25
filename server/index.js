@@ -25,7 +25,13 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: '1mb' }));
 const prod = process.env.NODE_ENV === 'production';
 app.use(session({ name: 'practicehub.sid', secret: process.env.SESSION_SECRET || 'local-dev-only-change-me', resave: false, saveUninitialized: false, cookie: { httpOnly: true, sameSite: 'lax', secure: prod, maxAge: 1000 * 60 * 60 * 12 }, store: process.env.MONGODB_URI ? MongoStore.create({ mongoUrl: process.env.MONGODB_URI, collectionName: 'sessions', ttl: 60 * 60 * 12 }) : undefined }));
-cloudinary.config({ cloud_name: process.env.CLOUDINARY_CLOUD_NAME, api_key: process.env.CLOUDINARY_API_KEY, api_secret: process.env.CLOUDINARY_API_SECRET, secure: true });
+const cloudinaryUrl = process.env.CLOUDINARY_URL;
+if (cloudinaryUrl) {
+  const parsedCloudinaryUrl = new URL(cloudinaryUrl);
+  cloudinary.config({ cloud_name: parsedCloudinaryUrl.hostname, api_key: decodeURIComponent(parsedCloudinaryUrl.username), api_secret: decodeURIComponent(parsedCloudinaryUrl.password), secure: true });
+} else {
+  cloudinary.config({ cloud_name: process.env.CLOUDINARY_CLOUD_NAME, api_key: process.env.CLOUDINARY_API_KEY, api_secret: process.env.CLOUDINARY_API_SECRET, secure: true });
+}
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024, files: 1 }, fileFilter: (_req, file, cb) => cb(null, ['image/png', 'image/jpeg', 'image/webp', 'application/pdf'].includes(file.mimetype)) });
 
 function auth(req, res, next) { if (!req.session.user) return res.status(401).json({ error: 'Sign in required' }); req.user = req.session.user; next(); }
