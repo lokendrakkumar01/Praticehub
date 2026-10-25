@@ -20,6 +20,10 @@ The included `render.yaml` describes a Render web service for the Express API an
 4. Wait for both Render services to finish deploying. Check `https://<api-host>/api/health` and confirm the database reports `connected`. Open the static site URL to view the dashboard.
 5. After successful setup, tighten MongoDB network access where practical and rotate any credential that may have been shared outside your password manager.
 
+To create the first coordinator, set `ADMIN_BOOTSTRAP_KEY` as a Render secret, deploy the backend, then open `/Admin/setup` on the frontend and submit the key with the coordinator name, email, and a 12+ character password. The endpoint only works while no coordinator exists. Remove the bootstrap secret from Render after setup. Admins can add students from Student Directory; students sign in at `/student/login` using the registered name and phone number. The current name-plus-phone sign-in is a simple identity check, not phone verification; use OTP verification before relying on it for sensitive student data.
+
+For direct paths such as `/Admin/login` and `/student/login` to load after a refresh, add a Static Site rewrite in Render: source `/*`, destination `/index.html`, action `Rewrite`.
+
 **Deployment limitation:** the current frontend is a UI preview and still renders clearly labeled sample records; it does not yet call the API. Deploying these services makes the API available, but it does not make the displayed dashboard data live. A coordinator account also needs to be provisioned securely before role-protected endpoints can be used; there is no public signup route. Complete the frontend API integration and secure coordinator bootstrap before using this with student records.
 
 ## Data and permissions
