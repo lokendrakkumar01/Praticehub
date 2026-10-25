@@ -40,6 +40,11 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 
   if (allowedScreenshotTypes.includes(file.mimetype)) return cb(null, true);
   cb(new multer.MulterError('LIMIT_UNEXPECTED_FILE', file.fieldname));
 } });
+const profileImageTypes = ['image/png', 'image/jpeg', 'image/webp'];
+const uploadProfileImage = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024, files: 1 }, fileFilter: (_req, file, cb) => {
+  if (profileImageTypes.includes(file.mimetype)) return cb(null, true);
+  const error = new Error('Profile picture must be PNG, JPG, or WebP'); error.statusCode = 400; cb(error);
+} });
 
 function auth(req, res, next) { if (!req.session.user) return res.status(401).json({ error: 'Sign in required' }); req.user = req.session.user; next(); }
 function roles(...allowed) { return (req, res, next) => allowed.includes(req.user?.role) ? next() : res.status(403).json({ error: 'Insufficient permissions' }); }
@@ -84,6 +89,24 @@ app.patch('/api/students/:id', auth, roles('coordinator'), async (req, res) => {
 });
 app.post('/api/students/import', auth, roles('coordinator'), async (req, res) => { try { if (typeof req.body.csv !== 'string' || req.body.csv.length > 5_000_000) return res.status(400).json({ error: 'CSV is missing or exceeds 5 MB' }); const rows = parse(req.body.csv, { columns: true, skip_empty_lines: true, trim: true, bom: true }); const clean = rows.map(r => ({ studentId: r.studentId || r['Student ID'], fullName: r.fullName || r['Full Name'] || r.name, rollNumber: r.rollNumber || r['Roll Number'], batch: r.batch || r['Batch / Section'] || r.section, phone: String(r.phone || r.Phone || '').replace(/\D/g,''), email: r.email || r.Email || undefined, enrollmentStatus: r.enrollmentStatus || 'Active' })).filter(r => r.studentId && r.fullName && r.rollNumber); const ops = clean.map(doc => ({ updateOne: { filter: { $or: [{ studentId: doc.studentId }, { rollNumber: doc.rollNumber }] }, update: { $setOnInsert: doc }, upsert: true } })); const result = ops.length ? await Student.bulkWrite(ops, { ordered: false }) : { upsertedCount: 0, matchedCount: 0 }; res.json({ imported: result.upsertedCount, alreadyPresent: result.matchedCount, ignored: rows.length - clean.length }); } catch (e) { fail(res, e); } });
 app.get('/api/students/:id', auth, async (req, res) => { try { if (req.user.role === 'student' && req.user.student !== req.params.id) return res.sendStatus(403); const student = await Student.findById(req.params.id).lean(); if (!student) return res.sendStatus(404); const records = await PracticeRecord.find({ student: student._id, ...recordQuery }).sort({ practiceDate: -1 }).limit(300).lean(); res.json({ student, records }); } catch (e) { fail(res, e); } });
+app.post('/api/students/me/profile-picture', auth, roles('student'), uploadProfileImage.single('profilePicture'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'Choose a PNG, JPG, or WebP profile picture' });
+    if (!(process.env.CLOUDINARY_CLOUD_NAME || cloudinary.config().cloud_name)) return res.status(503).json({ error: 'Profile picture storage is not configured on the backend' });
+    const student = await Student.findById(req.user.student);
+    if (!student) return res.sendStatus(404);
+    const image = await new Promise((resolve, reject) => {
+      const stream = cloudinary.uploader.upload_stream({ folder: 'practicehub/profiles', resource_type: 'image' }, (err, result) => err ? reject(err) : resolve(result));
+      Readable.from(req.file.buffer).pipe(stream);
+    });
+    const previousPhotoId = student.photoPublicId;
+    student.photoUrl = image.secure_url;
+    student.photoPublicId = image.public_id;
+    await student.save();
+    if (previousPhotoId) cloudinary.uploader.destroy(previousPhotoId, { resource_type: 'image' }).catch(() => {});
+    res.json({ student: { id: String(student._id), fullName: student.fullName, photoUrl: student.photoUrl } });
+  } catch (e) { fail(res, e); }
+});
 
 async function uploadScreenshot(file) {
   if (!file) return null;
@@ -98,7 +121,7 @@ async function uploadScreenshot(file) {
   });
 }
 app.get('/api/records', auth, async (req, res) => { try { const page = Math.max(1, Number(req.query.page) || 1), limit = Math.min(100, Number(req.query.limit) || 25); const filter = { ...(req.user.role === 'student' ? { student: req.user.student } : {}), ...(req.query.module ? { module: req.query.module } : {}), ...(req.query.status && req.user.role !== 'student' ? { status: req.query.status } : {}), ...(req.query.start && req.query.end ? { practiceDate: getWeek(req.query.start, req.query.end) } : {}) }; const [rows,total]=await Promise.all([PracticeRecord.find(filter).populate('student','fullName studentId').sort({practiceDate:-1,practiceTime:-1}).skip((page-1)*limit).limit(limit).lean(),PracticeRecord.countDocuments(filter)]); res.json({rows,total,page,pages:Math.ceil(total/limit)}); } catch(e){fail(res,e);} });
-app.post('/api/records', auth, roles('coordinator'), upload.single('screenshot'), async (req,res)=>{try{if(!req.file)return res.status(400).json({error:'Attach a screenshot or PDF before saving this practice score'});const body={...req.body,student:req.body.studentId,coordinator:req.user.id,practiceDate:new Date(`${req.body.practiceDate}T${req.body.practiceTime||'12:00'}:00`),maxScore:Number(req.body.maxScore),score:Number(req.body.score)};body.dayOfWeek=body.practiceDate.toLocaleDateString('en-US',{weekday:'long',timeZone:'UTC'});body.percentage=Number((body.score/body.maxScore*100).toFixed(2));body.screenshot=await uploadScreenshot(req.file);const row=await PracticeRecord.create(body);res.status(201).json(row);}catch(e){fail(res,e);}});
+app.post('/api/records', auth, roles('coordinator'), upload.single('screenshot'), async (req,res)=>{try{const body={...req.body,student:req.body.studentId,coordinator:req.user.id,practiceDate:new Date(`${req.body.practiceDate}T${req.body.practiceTime||'12:00'}:00`),maxScore:Number(req.body.maxScore),score:Number(req.body.score)};body.dayOfWeek=body.practiceDate.toLocaleDateString('en-US',{weekday:'long',timeZone:'UTC'});body.percentage=Number((body.score/body.maxScore*100).toFixed(2));body.screenshot=req.file?await uploadScreenshot(req.file):undefined;const row=await PracticeRecord.create(body);res.status(201).json(row);}catch(e){fail(res,e);}});
 app.patch('/api/records/:id', auth, roles('coordinator'), upload.single('screenshot'), async (req,res)=>{try{const old=await PracticeRecord.findById(req.params.id);if(!old)return res.sendStatus(404);const previous={score:old.score,maxScore:old.maxScore,percentage:old.percentage,status:old.status};for(const k of ['studentId','module','score','maxScore','practiceDate','practiceTime','duration','remarks','status'])if(req.body[k]!==undefined)old[k]=k==='score'||k==='maxScore'?Number(req.body[k]):req.body[k];if(req.body.score!==undefined||req.body.maxScore!==undefined)old.percentage=Number((old.score/old.maxScore*100).toFixed(2));if(req.file)old.screenshot=await uploadScreenshot(req.file);old.coordinator=req.user.id;await old.save();const updated={score:old.score,maxScore:old.maxScore,percentage:old.percentage,status:old.status};if(JSON.stringify(previous)!==JSON.stringify(updated)){await AuditLog.create({record:old._id,actor:req.user.id,action:'score_corrected',previous,updated});if(old.status==='Published'&&previous.status!=='Published')await AuditLog.create({record:old._id,actor:req.user.id,action:'record_published',updated});}res.json(old);}catch(e){fail(res,e);}});
 app.delete('/api/records/:id', auth, roles('coordinator'), async(req,res)=>{try{const row=await PracticeRecord.findById(req.params.id);if(!row)return res.sendStatus(404);await AuditLog.create({record:row._id,actor:req.user.id,action:'record_deleted',previous:{score:row.score,maxScore:row.maxScore,status:row.status}});await row.deleteOne();res.sendStatus(204);}catch(e){fail(res,e);}});
 app.get('/api/records/:id/audit', auth, roles('coordinator','faculty'), async(req,res)=>{try{res.json(await AuditLog.find({record:req.params.id}).populate('actor','name role').sort({createdAt:-1}).lean());}catch(e){fail(res,e);}});
@@ -113,9 +136,11 @@ app.get('/api/reports/summary',auth,roles('coordinator','faculty'),async(req,res
 app.get('/api/reports/export.csv',auth,roles('coordinator','faculty'),async(req,res)=>{try{const rows=await PracticeRecord.find({...recordQuery,...(req.query.start&&req.query.end?{practiceDate:getWeek(req.query.start,req.query.end)}:{})}).populate('student','fullName studentId').sort({practiceDate:-1}).limit(10000).lean();const csv=['studentId,student,module,date,score,maxScore,percentage,attemptStatus',...rows.map(r=>[r.student?.studentId,r.student?.fullName,r.module,new Date(r.practiceDate).toISOString(),r.score,r.maxScore,r.percentage,r.status].map(csvCell).join(','))].join('\r\n');res.type('text/csv').attachment('practicehub-report.csv').send(csv);}catch(e){fail(res,e);}});
 
 app.use((error, _req, res, _next) => {
+  if (error?.statusCode) return res.status(error.statusCode).json({ error: error.message });
   if (error instanceof multer.MulterError) {
     const tooLarge = error.code === 'LIMIT_FILE_SIZE';
-    return res.status(tooLarge ? 413 : 400).json({ error: tooLarge ? 'Screenshot must be 10 MB or smaller' : 'Upload one PNG, JPG, WebP, or PDF screenshot' });
+    const profile = error.field === 'profilePicture';
+    return res.status(tooLarge ? 413 : 400).json({ error: tooLarge ? (profile ? 'Profile picture must be 5 MB or smaller' : 'Screenshot must be 10 MB or smaller') : 'Upload one PNG, JPG, WebP, or PDF screenshot' });
   }
   console.error(error);
   return res.status(500).json({ error: 'Unable to complete request' });
