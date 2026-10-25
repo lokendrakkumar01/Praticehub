@@ -20,7 +20,7 @@ The included `render.yaml` describes a Render web service for the Express API an
 4. Wait for both Render services to finish deploying. Check `https://<api-host>/api/health` and confirm the database reports `connected`. Open the static site URL to view the dashboard.
 5. After successful setup, tighten MongoDB network access where practical and rotate any credential that may have been shared outside your password manager.
 
-The admin login uses only the `ADMIN_EMAIL` and `ADMIN_PASSWORD` configured on the backend. The app has no public admin signup or recovery form. Update those values in Render to change the credentials, then redeploy the backend. Admins can add students from Student Directory; students sign in at `/student/login` using the registered name and phone number. The current name-plus-phone sign-in is a simple identity check, not phone verification; use OTP verification before relying on it for sensitive student data.
+The admin login uses only the `ADMIN_EMAIL` and `ADMIN_PASSWORD` configured on the backend. The app has no public admin signup or recovery form. Update those values in Render to change the credentials, then redeploy the backend. Students can create an account at `/student/register` with their name and phone number, or use an admin-created directory account; both sign in at `/student/login` with the same details. Name-plus-phone is a simple identity check, not phone verification; use OTP verification before relying on it for sensitive student data.
 
 For direct paths such as `/Admin/login` and `/student/login` to load after a refresh, add a Static Site rewrite in Render: source `/*`, destination `/index.html`, action `Rewrite`.
 
