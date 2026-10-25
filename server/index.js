@@ -15,6 +15,8 @@ const app = express();
 const port = Number(process.env.PORT || 4000);
 const allowedOrigins = (process.env.APP_ORIGIN || 'http://localhost:5173').split(',').map(x => x.trim());
 app.disable('x-powered-by');
+// Render terminates TLS at its proxy; trust it so Express can issue Secure cookies.
+if (process.env.NODE_ENV === 'production') app.set('trust proxy', 1);
 app.use(helmet());
 app.use((req, res, next) => {
   const origin = req.headers.origin;
@@ -24,7 +26,7 @@ app.use((req, res, next) => {
 });
 app.use(express.json({ limit: '1mb' }));
 const prod = process.env.NODE_ENV === 'production';
-app.use(session({ name: 'practicehub.sid', secret: process.env.SESSION_SECRET || 'local-dev-only-change-me', resave: false, saveUninitialized: false, cookie: { httpOnly: true, sameSite: 'lax', secure: prod, maxAge: 1000 * 60 * 60 * 12 }, store: process.env.MONGODB_URI ? MongoStore.create({ mongoUrl: process.env.MONGODB_URI, collectionName: 'sessions', ttl: 60 * 60 * 12 }) : undefined }));
+app.use(session({ name: 'practicehub.sid', secret: process.env.SESSION_SECRET || 'local-dev-only-change-me', resave: false, saveUninitialized: false, cookie: { httpOnly: true, sameSite: prod ? 'none' : 'lax', secure: prod, maxAge: 1000 * 60 * 60 * 12 }, store: process.env.MONGODB_URI ? MongoStore.create({ mongoUrl: process.env.MONGODB_URI, collectionName: 'sessions', ttl: 60 * 60 * 12 }) : undefined }));
 const cloudinaryUrl = process.env.CLOUDINARY_URL;
 if (cloudinaryUrl) {
   const parsedCloudinaryUrl = new URL(cloudinaryUrl);
