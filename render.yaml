@@ -13,8 +13,12 @@ services:
         sync: false
       - key: SESSION_SECRET
         generateValue: true
-      - key: ADMIN_BOOTSTRAP_KEY
+      - key: ADMIN_EMAIL
         sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: ADMIN_NAME
+        value: PracticeHub Admin
       - key: APP_ORIGIN
         sync: false
       - key: CLOUDINARY_URL
