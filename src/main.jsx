@@ -5,17 +5,8 @@ import { Area, AreaChart, Bar, BarChart, CartesianGrid, ResponsiveContainer, Too
 import './style.css';
 import './auth.css';
 
-const seed = [
- {name:'Aarav Sharma',id:'PH-2024-001',batch:'MBA · Batch 2025',points:948,attempts:28,avg:92,best:100,last:'Today, 10:42 AM',trend:12,color:'violet'},
- {name:'Ananya Patel',id:'PH-2024-014',batch:'MBA · Batch 2025',points:912,attempts:25,avg:89,best:98,last:'Today, 9:18 AM',trend:8,color:'rose'},
- {name:'Rohan Mehta',id:'PH-2024-008',batch:'MBA · Batch 2025',points:876,attempts:24,avg:86,best:96,last:'Yesterday',trend:5,color:'blue'},
- {name:'Priya Singh',id:'PH-2024-021',batch:'MBA · Batch 2025',points:842,attempts:22,avg:84,best:95,last:'Today, 8:30 AM',trend:11,color:'amber'},
- {name:'Ishaan Verma',id:'PH-2024-003',batch:'MBA · Batch 2025',points:806,attempts:21,avg:81,best:94,last:'Yesterday',trend:-2,color:'teal'},
- {name:'Meera Joshi',id:'PH-2024-019',batch:'MBA · Batch 2025',points:780,attempts:19,avg:79,best:92,last:'Oct 23, 2026',trend:7,color:'indigo'},
- {name:'Kabir Gupta',id:'PH-2024-012',batch:'MBA · Batch 2025',points:742,attempts:18,avg:76,best:90,last:'Oct 22, 2026',trend:3,color:'cyan'},
- {name:'Sara Khan',id:'PH-2024-026',batch:'MBA · Batch 2025',points:710,attempts:17,avg:74,best:89,last:'Oct 22, 2026',trend:9,color:'pink'},
-];
-const chart = [{d:'Mon',score:62,attempts:8},{d:'Tue',score:70,attempts:11},{d:'Wed',score:67,attempts:9},{d:'Thu',score:78,attempts:14},{d:'Fri',score:74,attempts:12},{d:'Sat',score:86,attempts:17},{d:'Sun',score:82,attempts:15}];
+const seed = [];
+const chart = [];
 const navGroups=[{title:'OVERVIEW',items:[['Dashboard',LayoutDashboard],['Leaderboard',Trophy],['Student Directory',Users]]},{title:'PRACTICE',items:[['Add Practice Record',Plus],['Practice History',Clock3],['Practice Center',BookOpen]]},{title:'INSIGHTS',items:[['Weekly Champions',Award],['Faculty Reports',BarChart3]]}];
 const studentNavGroups=[{title:'MY PRACTICE',items:[['Dashboard',LayoutDashboard],['My Scores',BarChart3],['Leaderboard',Trophy],['Practice Center',BookOpen]]}];
 const API=(import.meta.env.VITE_API_URL||'https://praticehub.onrender.com/api').replace(/\/$/,'');
