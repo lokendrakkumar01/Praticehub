@@ -78,7 +78,26 @@ function AdminRecordForm({onSaved,refresh}){
   </div>;
 }
 function AdminRecordHistory({refresh}){const[rows,setRows]=useState(null),[error,setError]=useState('');useEffect(()=>{api('/records?limit=100').then(d=>setRows(d.rows)).catch(e=>setError(e.message));},[refresh]);return <section className="card preview-table"><div className="card-head"><div><h2>Practice history</h2><p>Database records entered by the coordinator</p></div></div>{error?<div className="empty-message">{error}</div>:!rows?<div className="empty-message">Loading records…</div>:rows.length?rows.map(r=><div className="preview-row" key={r._id}><div className="practice-symbol"><Target size={16}/></div><div className="preview-student"><strong>{r.student?.fullName||'Student'} · {r.module}</strong><span>{new Date(r.practiceDate).toLocaleDateString()} · {r.status}</span></div><span className="preview-score">{r.percentage}%<small>{scoreOutOf50(r)}</small></span></div>):<div className="empty-message">No practice records have been entered yet.</div>}</section>}
-function LiveLeaderboard(){const[rows,setRows]=useState(null),[error,setError]=useState('');useEffect(()=>{api('/leaderboard').then(setRows).catch(e=>setError(e.message));},[]);return <section className="card preview-table"><div className="card-head"><div><h2>Leaderboard</h2><p>Rankings from published practice records; average percentage, then verified attempts.</p></div></div>{error?<div className="empty-message">{error}</div>:!rows?<div className="empty-message">Loading leaderboard…</div>:rows.length?rows.map((r,i)=><div className="preview-row" key={r.student._id}><Rank i={i}/><div className="avatar avatar-purple">{initials(r.student.fullName)}</div><div className="preview-student"><strong>{r.student.fullName}</strong><span>{r.student.batch||r.student.studentId}</span></div><span className="preview-score">{r.average}%<small>{r.attempts} verified attempts</small></span></div>):<div className="empty-message">No published scores are ranked yet.</div>}</section>}
+function LiveLeaderboard(){
+  const [rows,setRows]=useState(null),[error,setError]=useState('');
+  useEffect(()=>{api('/leaderboard').then(setRows).catch(e=>setError(e.message));},[]);
+  const score50=value=>`${Number((Number(value||0)/2).toFixed(1)).toString()}/50`;
+  const attempts=rows?.reduce((total,row)=>total+Number(row.attempts||0),0)||0;
+  return <section className="card leaderboard-card">
+    <div className="leaderboard-heading"><div><span className="leaderboard-kicker">PRACTICEHUB RANKINGS</span><h2>Leaderboard</h2><p>Student scores and attempts from published practice records.</p></div><div className="leaderboard-trophy"><Trophy size={22}/></div></div>
+    {error?<div className="empty-message">{error}</div>:!rows?<div className="empty-message">Loading leaderboard…</div>:rows.length?<>
+      <div className="leaderboard-summary"><div><strong>{rows.length}</strong><span>Students ranked</span></div><div><strong>{attempts}</strong><span>Total attempts</span></div><div><strong>{score50(rows[0].average)}</strong><span>Top average score</span></div></div>
+      <div className="leaderboard-column-head"><span>Rank / student</span><span>Average score</span><span>Attempts</span><span>Best score</span></div>
+      <div className="leaderboard-rows">{rows.map((r,i)=><article className={`leaderboard-row ${i<3?`leaderboard-top-${i+1}`:''}`} key={r.student._id}>
+        <div className="leaderboard-rank"><span>{r.rank||i+1}</span></div>
+        <div className="leaderboard-person"><div className="avatar avatar-purple">{initials(r.student.fullName)}</div><div className="preview-student"><strong>{r.student.fullName}</strong><span>{r.student.batch||r.student.studentId||'PracticeHub student'}</span></div></div>
+        <div className="leaderboard-average"><strong>{score50(r.average)}</strong><small>{Number(r.average||0).toFixed(1)}% average</small></div>
+        <div className="leaderboard-attempts"><strong>{r.attempts}</strong><small>{r.attempts===1?'attempt':'attempts'}</small></div>
+        <div className="leaderboard-best"><strong>{score50(r.best)}</strong><small>Best score</small></div>
+      </article>)}</div>
+    </>:<div className="empty-message">No published scores are ranked yet.</div>}
+  </section>;
+}
 function StudentDirectory(){
   const [rows,setRows]=useState(null),[query,setQuery]=useState(''),[show,setShow]=useState(false),[editing,setEditing]=useState(null),[error,setError]=useState(''),[busy,setBusy]=useState(false);
   const load=()=>api(`/students?q=${encodeURIComponent(query)}&limit=100`).then(d=>setRows(d.rows)).catch(e=>setError(e.message));
