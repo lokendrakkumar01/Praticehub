@@ -20,7 +20,8 @@ const liveTickets = new Map();
 let leaderboardSockets;
 const webSocketServer = new WebSocketServer({ noServer: true, maxPayload: 1024 });
 function broadcastLeaderboardUpdate(){if(!leaderboardSockets)return;const message=JSON.stringify({type:'leaderboard:update',updatedAt:Date.now()});for(const client of leaderboardSockets.clients)if(client.readyState===WebSocket.OPEN)client.send(message);}
-httpServer.on('upgrade',(req,socket,head)=>{let url;try{url=new URL(req.url,'http://localhost');}catch{socket.destroy();return;}if(url.pathname!=='/api/live'){socket.destroy();return;}const origin=req.headers.origin;if(origin&&!allowedOrigins.includes(origin)){socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');socket.destroy();return;}const ticket=url.searchParams.get('ticket'),session=liveTickets.get(ticket);if(!session||session.expiresAt<Date.now()){if(ticket)liveTickets.delete(ticket);socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');socket.destroy();return;}liveTickets.delete(ticket);webSocketServer.handleUpgrade(req,socket,head,ws=>{ws.sessionId=session.sessionId;webSocketServer.emit('connection',ws,req);});});
+function disconnectStudentSockets(studentId){for(const [key,ticket] of liveTickets)if(ticket.studentId===studentId)liveTickets.delete(key);for(const client of webSocketServer.clients)if(client.studentId===studentId)client.close(1000,'Student account is no longer active');}
+httpServer.on('upgrade',(req,socket,head)=>{let url;try{url=new URL(req.url,'http://localhost');}catch{socket.destroy();return;}if(url.pathname!=='/api/live'){socket.destroy();return;}const origin=req.headers.origin;if(origin&&!allowedOrigins.includes(origin)){socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');socket.destroy();return;}const ticket=url.searchParams.get('ticket'),session=liveTickets.get(ticket);if(!session||session.expiresAt<Date.now()){if(ticket)liveTickets.delete(ticket);socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');socket.destroy();return;}liveTickets.delete(ticket);webSocketServer.handleUpgrade(req,socket,head,ws=>{ws.sessionId=session.sessionId;ws.studentId=session.studentId;webSocketServer.emit('connection',ws,req);});});
 webSocketServer.on('connection',ws=>{ws.isAlive=true;ws.on('pong',()=>{ws.isAlive=true;});});
 setInterval(()=>{for(const client of webSocketServer.clients){if(!client.isAlive){client.terminate();continue;}client.isAlive=false;client.ping();}},30000).unref();
 const port = Number(process.env.PORT || 4000);
@@ -57,7 +58,19 @@ const uploadProfileImage = multer({ storage: multer.memoryStorage(), limits: { f
   const error = new Error('Profile picture must be PNG, JPG, or WebP'); error.statusCode = 400; cb(error);
 } });
 
-function auth(req, res, next) { if (!req.session.user) return res.status(401).json({ error: 'Sign in required' }); req.user = req.session.user; next(); }
+async function auth(req, res, next) {
+  if (!req.session.user) return res.status(401).json({ error: 'Sign in required' });
+  req.user = req.session.user;
+  if (req.user.role === 'student') {
+    try {
+      const active = await Student.exists({ _id: req.user.student, enrollmentStatus: 'Active' });
+      if (!active) {
+        return req.session.destroy(() => { res.clearCookie('practicehub.sid'); res.status(401).json({ error: 'This student account is no longer active' }); });
+      }
+    } catch (error) { return fail(res, error); }
+  }
+  next();
+}
 function roles(...allowed) { return (req, res, next) => allowed.includes(req.user?.role) ? next() : res.status(403).json({ error: 'Insufficient permissions' }); }
 function fail(res, error) { if (error?.code === 11000) return res.status(409).json({ error: 'A matching record already exists' }); if (error?.statusCode) return res.status(error.statusCode).json({ error: error.message }); if (error?.name === 'ValidationError' || error?.name === 'CastError') return res.status(400).json({ error: error.message }); console.error(error); return res.status(500).json({ error: 'Unable to complete request' }); }
 function establishSession(req, user) { return new Promise((resolve, reject) => { req.session.regenerate(error => { if (error) return reject(error); req.session.user = user; req.session.save(saveError => saveError ? reject(saveError) : resolve(user)); }); }); }
@@ -66,11 +79,28 @@ const getWeek = (start, end) => ({ $gte: new Date(start), $lte: new Date(`${end}
 
 app.get('/api/health', (_req, res) => res.json({ ok: true, database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected' }));
 app.post('/api/auth/login', async (req, res) => { try { const email = String(req.body.email || '').trim().toLowerCase(); const user = email === String(process.env.ADMIN_EMAIL || '').trim().toLowerCase() ? await User.findOne({ email, active: true, role: 'coordinator' }) : null; if (!user || !(await bcrypt.compare(String(req.body.password || ''), user.passwordHash))) return res.status(401).json({ error: 'Invalid email or password' }); const sessionUser = await establishSession(req, { id: user.id, name: user.name, email: user.email, role: user.role }); res.json({ user: sessionUser }); } catch (e) { fail(res, e); } });
-app.post('/api/auth/student-login', async (req, res) => { try { const name=String(req.body.name||'').trim(); const phone=String(req.body.phone||'').replace(/\D/g,''); if(!name||phone.length<10)return res.status(400).json({error:'Enter your full name and a valid phone number'}); const student=await Student.findOne({fullName:new RegExp(`^${escapeRegex(name)}$`,'i'),phone,enrollmentStatus:'Active'}).lean(); if(!student)return res.status(401).json({error:'Name and phone number did not match an active student'}); const sessionUser = await establishSession(req, { id:String(student._id),student:String(student._id),name:student.fullName,role:'student' }); res.json({user:sessionUser}); } catch(e){fail(res,e);} });
-app.post('/api/auth/student-register', async (req, res) => { try { const name=String(req.body.name||'').trim(); const phone=String(req.body.phone||'').replace(/\D/g,''); if(name.length<2||name.length>120||phone.length<10||phone.length>15)return res.status(400).json({error:'Enter your full name and a phone number with 10 to 15 digits'}); let student=await Student.findOne({fullName:new RegExp(`^${escapeRegex(name)}$`,'i'),phone,enrollmentStatus:'Active'}); if(!student){const id=`SELF-${randomUUID()}`;student=await Student.create({studentId:id,fullName:name,rollNumber:id,batch:'Self-registered',phone,enrollmentStatus:'Active'});} const sessionUser=await establishSession(req,{id:String(student._id),student:String(student._id),name:student.fullName,role:'student'});res.status(201).json({user:sessionUser});}catch(e){fail(res,e);} });
+app.post('/api/auth/student-login', async (req, res) => { try { const name=String(req.body.name||'').trim(); const phone=String(req.body.phone||'').replace(/\D/g,''); if(name.length<2||name.length>120||phone.length<10||phone.length>15)return res.status(400).json({error:'Enter your full name and a valid phone number'}); let student=await Student.findOne({fullName:new RegExp(`^${escapeRegex(name)}$`,'i'),phone,enrollmentStatus:'Active'}); if(!student)return res.status(401).json({error:'Name and phone number did not match an active student'}); if(!student.accountActivatedAt){student.accountActivatedAt=new Date();await student.save();} student=student.toObject(); const sessionUser = await establishSession(req, { id:String(student._id),student:String(student._id),name:student.fullName,role:'student' }); res.json({user:sessionUser}); } catch(e){fail(res,e);} });
+app.post('/api/auth/student-register', async (req, res) => {
+  try {
+    const name = String(req.body.name || '').trim(), phone = String(req.body.phone || '').replace(/\D/g, '');
+    if (name.length < 2 || name.length > 120 || phone.length < 10 || phone.length > 15) return res.status(400).json({ error: 'Enter your full name and a phone number with 10 to 15 digits' });
+    let student = await Student.findOne({ fullName: new RegExp(`^${escapeRegex(name)}$`, 'i'), phone });
+    if (student) {
+      if (student.enrollmentStatus !== 'Active') return res.status(403).json({ error: 'This student account is inactive. Contact the administrator.' });
+      if (student.accountActivatedAt || student.batch === 'Self-registered') return res.status(409).json({ error: 'This student account has already been created. Use Student login instead.' });
+      student = await Student.findOneAndUpdate({ _id: student._id, enrollmentStatus: 'Active', accountActivatedAt: { $exists: false } }, { $set: { accountActivatedAt: new Date() } }, { new: true });
+      if (!student) return res.status(409).json({ error: 'This student account has already been created. Use Student login instead.' });
+    } else {
+      const id = `SELF-${randomUUID()}`;
+      student = await Student.create({ studentId: id, fullName: name, rollNumber: id, batch: 'Self-registered', phone, accountActivatedAt: new Date(), enrollmentStatus: 'Active' });
+    }
+    const sessionUser = await establishSession(req, { id: String(student._id), student: String(student._id), name: student.fullName, role: 'student' });
+    res.status(201).json({ user: sessionUser });
+  } catch (e) { fail(res, e); }
+});
 app.post('/api/auth/logout', auth, (req, res) => {for(const client of webSocketServer.clients)if(client.sessionId===req.sessionID)client.close(1000,'Signed out');req.session.destroy(() => { res.clearCookie('practicehub.sid'); res.sendStatus(204); });});
 app.get('/api/auth/me', auth, (req, res) => res.json({ user: req.user }));
-app.post('/api/auth/live-ticket',auth,(req,res)=>{for(const [key,value] of liveTickets)if(value.expiresAt<Date.now())liveTickets.delete(key);const ticket=randomUUID();liveTickets.set(ticket,{sessionId:req.sessionID,expiresAt:Date.now()+30000});res.json({ticket});});
+app.post('/api/auth/live-ticket',auth,(req,res)=>{for(const [key,value] of liveTickets)if(value.expiresAt<Date.now())liveTickets.delete(key);const ticket=randomUUID();liveTickets.set(ticket,{sessionId:req.sessionID,studentId:req.user.role==='student'?String(req.user.student):null,expiresAt:Date.now()+30000});res.json({ticket});});
 app.post('/api/users', auth, roles('coordinator'), async (req, res) => { try { const { name, email, password, role } = req.body; if (!name || !email || !password || !['coordinator', 'faculty', 'student'].includes(role)) return res.status(400).json({ error: 'Name, email, password, and a valid role are required' }); const user = await User.create({ name, email: email.toLowerCase(), passwordHash: await bcrypt.hash(password, 12), role, student: req.body.student || undefined }); res.status(201).json({ id: user.id, name: user.name, email: user.email, role: user.role }); } catch (e) { fail(res, e); } });
 
 app.get('/api/students', auth, async (req, res) => { try { const page = Math.max(1, Number(req.query.page) || 1), limit = Math.min(100, Math.max(1, Number(req.query.limit) || 25)); const q = String(req.query.q || '').trim(); const filter = { ...(q ? { $or: [{ fullName: new RegExp(escapeRegex(q), 'i') }, { rollNumber: new RegExp(escapeRegex(q), 'i') }] } : {}), ...(req.query.status ? { enrollmentStatus: req.query.status } : {}) }; if (req.user.role === 'student') filter._id = req.user.student; const [rows, total] = await Promise.all([Student.find(filter).sort({ fullName: 1 }).skip((page - 1) * limit).limit(limit).lean(), Student.countDocuments(filter)]); res.json({ rows, total, page, pages: Math.ceil(total / limit) }); } catch (e) { fail(res, e); } });
@@ -96,8 +126,28 @@ app.patch('/api/students/:id', auth, roles('coordinator'), async (req, res) => {
     row.phone = phone;
     row.enrollmentStatus = enrollmentStatus;
     await row.save();
+    if (enrollmentStatus !== 'Active') disconnectStudentSockets(String(row._id));
     broadcastLeaderboardUpdate();
     res.json(row);
+  } catch (e) { fail(res, e); }
+});
+app.delete('/api/students/:id', auth, roles('coordinator'), async (req, res) => {
+  try {
+    const student = await Student.findById(req.params.id).lean();
+    if (!student) return res.sendStatus(404);
+    const records = await PracticeRecord.find({ student: student._id }).select('screenshot.publicId').lean();
+    await Promise.all([
+      PracticeRecord.deleteMany({ student: student._id }),
+      WinnerApproval.deleteMany({ candidate: student._id }),
+      Competition.updateMany({ officialWinner: student._id }, { $unset: { officialWinner: 1, announcementPublished: 1 } }),
+      User.deleteMany({ student: student._id })
+    ]);
+    await Student.deleteOne({ _id: student._id });
+    disconnectStudentSockets(String(student._id));
+    broadcastLeaderboardUpdate();
+    const publicIds = [...records.map(record => record.screenshot?.publicId).filter(Boolean), student.photoPublicId].filter(Boolean);
+    await Promise.allSettled(publicIds.map(publicId => cloudinary.uploader.destroy(publicId)));
+    res.sendStatus(204);
   } catch (e) { fail(res, e); }
 });
 app.post('/api/students/import', auth, roles('coordinator'), async (req, res) => { try { if (typeof req.body.csv !== 'string' || req.body.csv.length > 5_000_000) return res.status(400).json({ error: 'CSV is missing or exceeds 5 MB' }); const rows = parse(req.body.csv, { columns: true, skip_empty_lines: true, trim: true, bom: true }); const clean = rows.map(r => ({ studentId: r.studentId || r['Student ID'], fullName: r.fullName || r['Full Name'] || r.name, rollNumber: r.rollNumber || r['Roll Number'], batch: r.batch || r['Batch / Section'] || r.section, phone: String(r.phone || r.Phone || '').replace(/\D/g,''), email: r.email || r.Email || undefined, enrollmentStatus: r.enrollmentStatus || 'Active' })).filter(r => r.studentId && r.fullName && r.rollNumber); const ops = clean.map(doc => ({ updateOne: { filter: { $or: [{ studentId: doc.studentId }, { rollNumber: doc.rollNumber }] }, update: { $setOnInsert: doc }, upsert: true } })); const result = ops.length ? await Student.bulkWrite(ops, { ordered: false }) : { upsertedCount: 0, matchedCount: 0 }; res.json({ imported: result.upsertedCount, alreadyPresent: result.matchedCount, ignored: rows.length - clean.length }); } catch (e) { fail(res, e); } });
