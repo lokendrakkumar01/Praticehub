@@ -121,15 +121,26 @@ async function uploadScreenshot(file) {
     Readable.from(file.buffer).pipe(stream);
   });
 }
+function normalizedScreenshotCount(value, hasFile, fallback = 0) {
+  const raw = value === undefined || value === null ? '' : String(value).trim();
+  const count = raw === '' ? (hasFile ? Math.max(1, Number(fallback) || 0) : Number(fallback) || 0) : Number(raw);
+  if (!Number.isInteger(count) || count < 0 || count > 1000) {
+    const error = new Error('Screenshot count must be a whole number from 0 to 1000');
+    error.statusCode = 400;
+    throw error;
+  }
+  return Math.max(count, hasFile ? 1 : 0);
+}
 app.get('/api/records', auth, async (req, res) => { try { const page = Math.max(1, Number(req.query.page) || 1), limit = Math.min(100, Number(req.query.limit) || 25); const filter = { ...(req.user.role === 'student' ? { student: req.user.student } : {}), ...(req.query.module ? { module: req.query.module } : {}), ...(req.query.status && req.user.role !== 'student' ? { status: req.query.status } : {}), ...(req.query.start && req.query.end ? { practiceDate: getWeek(req.query.start, req.query.end) } : {}) }; const [rows,total]=await Promise.all([PracticeRecord.find(filter).populate('student','fullName studentId photoUrl batch').sort({practiceDate:-1,practiceTime:-1}).skip((page-1)*limit).limit(limit).lean(),PracticeRecord.countDocuments(filter)]); res.json({rows,total,page,pages:Math.ceil(total/limit)}); } catch(e){fail(res,e);} });
-app.post('/api/records', auth, roles('coordinator'), upload.single('screenshot'), async (req,res)=>{try{const score=Number(req.body.score);if(!Number.isFinite(score)||score<0||score>50)return res.status(400).json({error:'Score must be between 0 and 50'});const body={...req.body,student:req.body.studentId,coordinator:req.user.id,practiceDate:new Date(`${req.body.practiceDate}T${req.body.practiceTime||'12:00'}:00`),maxScore:50,score};body.dayOfWeek=body.practiceDate.toLocaleDateString('en-US',{weekday:'long',timeZone:'UTC'});body.percentage=Number((body.score/body.maxScore*100).toFixed(2));body.screenshot=req.file?await uploadScreenshot(req.file):undefined;const row=await PracticeRecord.create(body);res.status(201).json(row);}catch(e){fail(res,e);}});
+app.post('/api/records', auth, roles('coordinator'), upload.single('screenshot'), async (req,res)=>{try{const score=Number(req.body.score);if(!Number.isFinite(score)||score<0||score>50)return res.status(400).json({error:'Score must be between 0 and 50'});const body={...req.body,student:req.body.studentId,coordinator:req.user.id,practiceDate:new Date(`${req.body.practiceDate}T${req.body.practiceTime||'12:00'}:00`),maxScore:50,score,screenshotCount:normalizedScreenshotCount(req.body.screenshotCount,Boolean(req.file))};body.dayOfWeek=body.practiceDate.toLocaleDateString('en-US',{weekday:'long',timeZone:'UTC'});body.percentage=Number((body.score/body.maxScore*100).toFixed(2));body.screenshot=req.file?await uploadScreenshot(req.file):undefined;const row=await PracticeRecord.create(body);res.status(201).json(row);}catch(e){fail(res,e);}});
 app.patch('/api/records/:id', auth, roles('coordinator'), upload.single('screenshot'), async (req,res)=>{try{
   const old=await PracticeRecord.findById(req.params.id);if(!old)return res.sendStatus(404);
-  const previous={student:String(old.student),module:old.module,score:old.score,maxScore:old.maxScore,percentage:old.percentage,practiceDate:old.practiceDate,practiceTime:old.practiceTime,dayOfWeek:old.dayOfWeek,status:old.status};
+  const previous={student:String(old.student),module:old.module,score:old.score,maxScore:old.maxScore,percentage:old.percentage,screenshotCount:old.screenshotCount||0,practiceDate:old.practiceDate,practiceTime:old.practiceTime,dayOfWeek:old.dayOfWeek,status:old.status};
   if(req.body.studentId!==undefined)old.student=req.body.studentId;
   for(const key of ['module','practiceTime','duration','remarks','status'])if(req.body[key]!==undefined)old[key]=req.body[key];
   if(req.body.score!==undefined)old.score=Number(req.body.score);
   if(req.body.maxScore!==undefined)old.maxScore=Number(req.body.maxScore);
+  if(req.body.screenshotCount!==undefined||req.file)old.screenshotCount=normalizedScreenshotCount(req.body.screenshotCount,Boolean(req.file),old.screenshotCount||(old.screenshot?.publicId?1:0));
   if(req.body.practiceDate!==undefined){const date=String(req.body.practiceDate);if(!/^\d{4}-\d{2}-\d{2}$/.test(date))return res.status(400).json({error:'Choose a valid practice date'});old.practiceDate=new Date(`${date}T${req.body.practiceTime||old.practiceTime||'12:00'}:00`);}
   if(req.body.practiceTime!==undefined&&req.body.practiceDate===undefined){const date=new Date(old.practiceDate).toISOString().slice(0,10);old.practiceDate=new Date(`${date}T${req.body.practiceTime}:00`);}
   if(!Number.isFinite(old.score)||!Number.isFinite(old.maxScore)||old.score<0||old.maxScore<=0||old.score>old.maxScore)return res.status(400).json({error:'Score must be between zero and the maximum score'});
@@ -138,7 +149,7 @@ app.patch('/api/records/:id', auth, roles('coordinator'), upload.single('screens
   old.percentage=Number((old.score/old.maxScore*100).toFixed(2));
   if(req.file)old.screenshot=await uploadScreenshot(req.file);
   old.coordinator=req.user.id;await old.save();
-  const updated={student:String(old.student),module:old.module,score:old.score,maxScore:old.maxScore,percentage:old.percentage,practiceDate:old.practiceDate,practiceTime:old.practiceTime,dayOfWeek:old.dayOfWeek,status:old.status};
+  const updated={student:String(old.student),module:old.module,score:old.score,maxScore:old.maxScore,percentage:old.percentage,screenshotCount:old.screenshotCount||0,practiceDate:old.practiceDate,practiceTime:old.practiceTime,dayOfWeek:old.dayOfWeek,status:old.status};
   if(JSON.stringify(previous)!==JSON.stringify(updated)){await AuditLog.create({record:old._id,actor:req.user.id,action:'score_corrected',previous,updated});if(old.status==='Published'&&previous.status!=='Published')await AuditLog.create({record:old._id,actor:req.user.id,action:'record_published',updated});}
   res.json(old);
 }catch(e){fail(res,e);}});
