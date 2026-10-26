@@ -162,8 +162,9 @@ app.get('/api/leaderboard', auth, async(req,res)=>{try{
     {$match:filter},{$sort:{student:1,percentage:-1,practiceDate:-1}},
     {$group:{_id:'$student',attempts:{$sum:1},total:{$sum:'$percentage'},scoreTotal:{$sum:'$score'},scales:{$addToSet:'$maxScore'},best:{$first:'$percentage'},bestPoints:{$first:'$score'},bestMaxScore:{$first:'$maxScore'},dates:{$addToSet:{$dateToString:{format:'%Y-%m-%d',date:'$practiceDate'}}},last:{$max:'$practiceDate'}}},
     {$addFields:{average:{$round:[{$divide:['$total','$attempts']},1]},averagePoints:{$round:[{$divide:['$scoreTotal','$attempts']},1]},averageMaxScore:{$cond:[{$eq:[{$size:'$scales'},1]},{$arrayElemAt:['$scales',0]},null]},consistency:{$size:'$dates'}}},
+    {$sort:{average:-1,attempts:-1}},...(req.query.limit?[{$limit:Math.floor(Math.min(100,Math.max(1,Number(req.query.limit)||5)))}]:[]),
     {$lookup:{from:'students',localField:'_id',foreignField:'_id',as:'student'}},{$unwind:'$student'},
-    {$sort:{average:-1,attempts:-1}},{$project:{student:{_id:'$student._id',fullName:'$student.fullName',studentId:'$student.studentId',batch:'$student.batch',photoUrl:'$student.photoUrl'},attempts:1,average:1,averagePoints:1,averageMaxScore:1,best:1,bestPoints:1,bestMaxScore:1,consistency:1,last:1,dates:1}}
+    {$project:{student:{_id:'$student._id',fullName:'$student.fullName',studentId:'$student.studentId',batch:'$student.batch',photoUrl:'$student.photoUrl'},attempts:1,average:1,averagePoints:1,averageMaxScore:1,best:1,bestPoints:1,bestMaxScore:1,consistency:1,last:1,dates:1}}
   ]);
   res.json(rows.map((row,index)=>({...row,rank:index+1,points:Math.round(row.average*row.attempts)})));
 }catch(e){fail(res,e);}});
