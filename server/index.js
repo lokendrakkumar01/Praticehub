@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import express from 'express';
+import { createServer } from 'node:http';
 import mongoose from 'mongoose';
 import session from 'express-session';
 import MongoStore from 'connect-mongo';
@@ -9,10 +10,19 @@ import multer from 'multer';
 import { v2 as cloudinary } from 'cloudinary';
 import { Readable } from 'node:stream';
 import { randomUUID } from 'node:crypto';
+import { WebSocketServer, WebSocket } from 'ws';
 import { parse } from 'csv-parse/sync';
 import { User, Student, PracticeRecord, Competition, WinnerApproval, AuditLog } from './models.js';
 
 const app = express();
+const httpServer = createServer(app);
+const liveTickets = new Map();
+let leaderboardSockets;
+const webSocketServer = new WebSocketServer({ noServer: true, maxPayload: 1024 });
+function broadcastLeaderboardUpdate(){if(!leaderboardSockets)return;const message=JSON.stringify({type:'leaderboard:update',updatedAt:Date.now()});for(const client of leaderboardSockets.clients)if(client.readyState===WebSocket.OPEN)client.send(message);}
+httpServer.on('upgrade',(req,socket,head)=>{let url;try{url=new URL(req.url,'http://localhost');}catch{socket.destroy();return;}if(url.pathname!=='/api/live'){socket.destroy();return;}const origin=req.headers.origin;if(origin&&!allowedOrigins.includes(origin)){socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');socket.destroy();return;}const ticket=url.searchParams.get('ticket'),session=liveTickets.get(ticket);if(!session||session.expiresAt<Date.now()){if(ticket)liveTickets.delete(ticket);socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');socket.destroy();return;}liveTickets.delete(ticket);webSocketServer.handleUpgrade(req,socket,head,ws=>{ws.sessionId=session.sessionId;webSocketServer.emit('connection',ws,req);});});
+webSocketServer.on('connection',ws=>{ws.isAlive=true;ws.on('pong',()=>{ws.isAlive=true;});});
+setInterval(()=>{for(const client of webSocketServer.clients){if(!client.isAlive){client.terminate();continue;}client.isAlive=false;client.ping();}},30000).unref();
 const port = Number(process.env.PORT || 4000);
 const allowedOrigins = (process.env.APP_ORIGIN || 'http://localhost:5173').split(',').map(x => x.trim());
 app.disable('x-powered-by');
@@ -58,8 +68,9 @@ app.get('/api/health', (_req, res) => res.json({ ok: true, database: mongoose.co
 app.post('/api/auth/login', async (req, res) => { try { const email = String(req.body.email || '').trim().toLowerCase(); const user = email === String(process.env.ADMIN_EMAIL || '').trim().toLowerCase() ? await User.findOne({ email, active: true, role: 'coordinator' }) : null; if (!user || !(await bcrypt.compare(String(req.body.password || ''), user.passwordHash))) return res.status(401).json({ error: 'Invalid email or password' }); const sessionUser = await establishSession(req, { id: user.id, name: user.name, email: user.email, role: user.role }); res.json({ user: sessionUser }); } catch (e) { fail(res, e); } });
 app.post('/api/auth/student-login', async (req, res) => { try { const name=String(req.body.name||'').trim(); const phone=String(req.body.phone||'').replace(/\D/g,''); if(!name||phone.length<10)return res.status(400).json({error:'Enter your full name and a valid phone number'}); const student=await Student.findOne({fullName:new RegExp(`^${escapeRegex(name)}$`,'i'),phone,enrollmentStatus:'Active'}).lean(); if(!student)return res.status(401).json({error:'Name and phone number did not match an active student'}); const sessionUser = await establishSession(req, { id:String(student._id),student:String(student._id),name:student.fullName,role:'student' }); res.json({user:sessionUser}); } catch(e){fail(res,e);} });
 app.post('/api/auth/student-register', async (req, res) => { try { const name=String(req.body.name||'').trim(); const phone=String(req.body.phone||'').replace(/\D/g,''); if(name.length<2||name.length>120||phone.length<10||phone.length>15)return res.status(400).json({error:'Enter your full name and a phone number with 10 to 15 digits'}); let student=await Student.findOne({fullName:new RegExp(`^${escapeRegex(name)}$`,'i'),phone,enrollmentStatus:'Active'}); if(!student){const id=`SELF-${randomUUID()}`;student=await Student.create({studentId:id,fullName:name,rollNumber:id,batch:'Self-registered',phone,enrollmentStatus:'Active'});} const sessionUser=await establishSession(req,{id:String(student._id),student:String(student._id),name:student.fullName,role:'student'});res.status(201).json({user:sessionUser});}catch(e){fail(res,e);} });
-app.post('/api/auth/logout', auth, (req, res) => req.session.destroy(() => { res.clearCookie('practicehub.sid'); res.sendStatus(204); }));
+app.post('/api/auth/logout', auth, (req, res) => {for(const client of webSocketServer.clients)if(client.sessionId===req.sessionID)client.close(1000,'Signed out');req.session.destroy(() => { res.clearCookie('practicehub.sid'); res.sendStatus(204); });});
 app.get('/api/auth/me', auth, (req, res) => res.json({ user: req.user }));
+app.post('/api/auth/live-ticket',auth,(req,res)=>{for(const [key,value] of liveTickets)if(value.expiresAt<Date.now())liveTickets.delete(key);const ticket=randomUUID();liveTickets.set(ticket,{sessionId:req.sessionID,expiresAt:Date.now()+30000});res.json({ticket});});
 app.post('/api/users', auth, roles('coordinator'), async (req, res) => { try { const { name, email, password, role } = req.body; if (!name || !email || !password || !['coordinator', 'faculty', 'student'].includes(role)) return res.status(400).json({ error: 'Name, email, password, and a valid role are required' }); const user = await User.create({ name, email: email.toLowerCase(), passwordHash: await bcrypt.hash(password, 12), role, student: req.body.student || undefined }); res.status(201).json({ id: user.id, name: user.name, email: user.email, role: user.role }); } catch (e) { fail(res, e); } });
 
 app.get('/api/students', auth, async (req, res) => { try { const page = Math.max(1, Number(req.query.page) || 1), limit = Math.min(100, Math.max(1, Number(req.query.limit) || 25)); const q = String(req.query.q || '').trim(); const filter = { ...(q ? { $or: [{ fullName: new RegExp(escapeRegex(q), 'i') }, { rollNumber: new RegExp(escapeRegex(q), 'i') }] } : {}), ...(req.query.status ? { enrollmentStatus: req.query.status } : {}) }; if (req.user.role === 'student') filter._id = req.user.student; const [rows, total] = await Promise.all([Student.find(filter).sort({ fullName: 1 }).skip((page - 1) * limit).limit(limit).lean(), Student.countDocuments(filter)]); res.json({ rows, total, page, pages: Math.ceil(total / limit) }); } catch (e) { fail(res, e); } });
@@ -85,6 +96,7 @@ app.patch('/api/students/:id', auth, roles('coordinator'), async (req, res) => {
     row.phone = phone;
     row.enrollmentStatus = enrollmentStatus;
     await row.save();
+    broadcastLeaderboardUpdate();
     res.json(row);
   } catch (e) { fail(res, e); }
 });
@@ -104,6 +116,7 @@ app.post('/api/students/me/profile-picture', auth, roles('student'), uploadProfi
     student.photoUrl = image.secure_url;
     student.photoPublicId = image.public_id;
     await student.save();
+    broadcastLeaderboardUpdate();
     if (previousPhotoId) cloudinary.uploader.destroy(previousPhotoId, { resource_type: 'image' }).catch(() => {});
     res.json({ student: { id: String(student._id), fullName: student.fullName, photoUrl: student.photoUrl } });
   } catch (e) { fail(res, e); }
@@ -132,7 +145,7 @@ function normalizedScreenshotCount(value, hasFile, fallback = 0) {
   return Math.max(count, hasFile ? 1 : 0);
 }
 app.get('/api/records', auth, async (req, res) => { try { const page = Math.max(1, Number(req.query.page) || 1), limit = Math.min(100, Number(req.query.limit) || 25); const filter = { ...(req.user.role === 'student' ? { student: req.user.student } : {}), ...(req.query.module ? { module: req.query.module } : {}), ...(req.query.status && req.user.role !== 'student' ? { status: req.query.status } : {}), ...(req.query.start && req.query.end ? { practiceDate: getWeek(req.query.start, req.query.end) } : {}) }; const [rows,total]=await Promise.all([PracticeRecord.find(filter).populate('student','fullName studentId photoUrl batch').sort({practiceDate:-1,practiceTime:-1}).skip((page-1)*limit).limit(limit).lean(),PracticeRecord.countDocuments(filter)]); res.json({rows,total,page,pages:Math.ceil(total/limit)}); } catch(e){fail(res,e);} });
-app.post('/api/records', auth, roles('coordinator'), upload.single('screenshot'), async (req,res)=>{try{const score=Number(req.body.score);if(!Number.isFinite(score)||score<0||score>50)return res.status(400).json({error:'Score must be between 0 and 50'});const body={...req.body,student:req.body.studentId,coordinator:req.user.id,practiceDate:new Date(`${req.body.practiceDate}T${req.body.practiceTime||'12:00'}:00`),maxScore:50,score,screenshotCount:normalizedScreenshotCount(req.body.screenshotCount,Boolean(req.file))};body.dayOfWeek=body.practiceDate.toLocaleDateString('en-US',{weekday:'long',timeZone:'UTC'});body.percentage=Number((body.score/body.maxScore*100).toFixed(2));body.screenshot=req.file?await uploadScreenshot(req.file):undefined;const row=await PracticeRecord.create(body);res.status(201).json(row);}catch(e){fail(res,e);}});
+app.post('/api/records', auth, roles('coordinator'), upload.single('screenshot'), async (req,res)=>{try{const score=Number(req.body.score);if(!Number.isFinite(score)||score<0||score>50)return res.status(400).json({error:'Score must be between 0 and 50'});const body={...req.body,student:req.body.studentId,coordinator:req.user.id,practiceDate:new Date(`${req.body.practiceDate}T${req.body.practiceTime||'12:00'}:00`),maxScore:50,score,screenshotCount:normalizedScreenshotCount(req.body.screenshotCount,Boolean(req.file))};body.dayOfWeek=body.practiceDate.toLocaleDateString('en-US',{weekday:'long',timeZone:'UTC'});body.percentage=Number((body.score/body.maxScore*100).toFixed(2));body.screenshot=req.file?await uploadScreenshot(req.file):undefined;const row=await PracticeRecord.create(body);broadcastLeaderboardUpdate();res.status(201).json(row);}catch(e){fail(res,e);}});
 app.patch('/api/records/:id', auth, roles('coordinator'), upload.single('screenshot'), async (req,res)=>{try{
   const old=await PracticeRecord.findById(req.params.id);if(!old)return res.sendStatus(404);
   const previous={student:String(old.student),module:old.module,score:old.score,maxScore:old.maxScore,percentage:old.percentage,screenshotCount:old.screenshotCount||0,practiceDate:old.practiceDate,practiceTime:old.practiceTime,dayOfWeek:old.dayOfWeek,status:old.status};
@@ -148,23 +161,24 @@ app.patch('/api/records/:id', auth, roles('coordinator'), upload.single('screens
   old.dayOfWeek=old.practiceDate.toLocaleDateString('en-US',{weekday:'long',timeZone:'UTC'});
   old.percentage=Number((old.score/old.maxScore*100).toFixed(2));
   if(req.file)old.screenshot=await uploadScreenshot(req.file);
-  old.coordinator=req.user.id;await old.save();
+  old.coordinator=req.user.id;await old.save();broadcastLeaderboardUpdate();
   const updated={student:String(old.student),module:old.module,score:old.score,maxScore:old.maxScore,percentage:old.percentage,screenshotCount:old.screenshotCount||0,practiceDate:old.practiceDate,practiceTime:old.practiceTime,dayOfWeek:old.dayOfWeek,status:old.status};
   if(JSON.stringify(previous)!==JSON.stringify(updated)){await AuditLog.create({record:old._id,actor:req.user.id,action:'score_corrected',previous,updated});if(old.status==='Published'&&previous.status!=='Published')await AuditLog.create({record:old._id,actor:req.user.id,action:'record_published',updated});}
   res.json(old);
 }catch(e){fail(res,e);}});
-app.delete('/api/records/:id', auth, roles('coordinator'), async(req,res)=>{try{const row=await PracticeRecord.findById(req.params.id);if(!row)return res.sendStatus(404);await AuditLog.create({record:row._id,actor:req.user.id,action:'record_deleted',previous:{score:row.score,maxScore:row.maxScore,status:row.status}});await row.deleteOne();res.sendStatus(204);}catch(e){fail(res,e);}});
+app.delete('/api/records/:id', auth, roles('coordinator'), async(req,res)=>{try{const row=await PracticeRecord.findById(req.params.id);if(!row)return res.sendStatus(404);await AuditLog.create({record:row._id,actor:req.user.id,action:'record_deleted',previous:{score:row.score,maxScore:row.maxScore,status:row.status}});await row.deleteOne();broadcastLeaderboardUpdate();res.sendStatus(204);}catch(e){fail(res,e);}});
 app.get('/api/records/:id/audit', auth, roles('coordinator','faculty'), async(req,res)=>{try{res.json(await AuditLog.find({record:req.params.id}).populate('actor','name role').sort({createdAt:-1}).lean());}catch(e){fail(res,e);}});
 
 app.get('/api/leaderboard', auth, async(req,res)=>{try{
   const filter={...recordQuery};if(req.query.start&&req.query.end)filter.practiceDate=getWeek(req.query.start,req.query.end);if(['Aptitude','Mock Interview'].includes(req.query.module))filter.module=req.query.module;
+  const rankByBest=req.query.sort==='best';
   const rows=await PracticeRecord.aggregate([
     {$match:filter},{$sort:{student:1,percentage:-1,practiceDate:-1}},
-    {$group:{_id:'$student',attempts:{$sum:1},total:{$sum:'$percentage'},scoreTotal:{$sum:'$score'},scales:{$addToSet:'$maxScore'},best:{$first:'$percentage'},bestPoints:{$first:'$score'},bestMaxScore:{$first:'$maxScore'},dates:{$addToSet:{$dateToString:{format:'%Y-%m-%d',date:'$practiceDate'}}},last:{$max:'$practiceDate'}}},
-    {$addFields:{average:{$round:[{$divide:['$total','$attempts']},1]},averagePoints:{$round:[{$divide:['$scoreTotal','$attempts']},1]},averageMaxScore:{$cond:[{$eq:[{$size:'$scales'},1]},{$arrayElemAt:['$scales',0]},null]},consistency:{$size:'$dates'}}},
-    {$sort:{average:-1,attempts:-1}},...(req.query.limit?[{$limit:Math.floor(Math.min(100,Math.max(1,Number(req.query.limit)||5)))}]:[]),
+    {$group:{_id:'$student',attempts:{$sum:1},total:{$sum:'$percentage'},scoreTotal:{$sum:'$score'},scales:{$addToSet:'$maxScore'},best:{$first:'$percentage'},bestPoints:{$first:'$score'},bestMaxScore:{$first:'$maxScore'},last:{$max:'$practiceDate'}}},
+    {$addFields:{average:{$round:[{$divide:['$total','$attempts']},1]},averagePoints:{$round:[{$divide:['$scoreTotal','$attempts']},1]},averageMaxScore:{$cond:[{$eq:[{$size:'$scales'},1]},{$arrayElemAt:['$scales',0]},null]}}},
+    {$sort:rankByBest?{best:-1,bestPoints:-1,attempts:-1,average:-1}:{average:-1,attempts:-1}},...(req.query.limit?[{$limit:Math.floor(Math.min(100,Math.max(1,Number(req.query.limit)||5)))}]:[]),
     {$lookup:{from:'students',localField:'_id',foreignField:'_id',as:'student'}},{$unwind:'$student'},
-    {$project:{student:{_id:'$student._id',fullName:'$student.fullName',studentId:'$student.studentId',batch:'$student.batch',photoUrl:'$student.photoUrl'},attempts:1,average:1,averagePoints:1,averageMaxScore:1,best:1,bestPoints:1,bestMaxScore:1,consistency:1,last:1,dates:1}}
+    {$project:{student:{_id:'$student._id',fullName:'$student.fullName',studentId:'$student.studentId',batch:'$student.batch',photoUrl:'$student.photoUrl'},attempts:1,average:1,averagePoints:1,averageMaxScore:1,best:1,bestPoints:1,bestMaxScore:1,last:1}}
   ]);
   res.json(rows.map((row,index)=>({...row,rank:index+1,points:Math.round(row.average*row.attempts)})));
 }catch(e){fail(res,e);}});
@@ -189,5 +203,5 @@ app.use((error, _req, res, _next) => {
 
 function escapeRegex(s){return s.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');}
 function csvCell(v){return `"${String(v??'').replaceAll('"','""')}"`;}
-async function start(){if(!process.env.MONGODB_URI){console.error('MONGODB_URI is required. Copy .env.example to .env and configure credentials.');process.exit(1);}if(!process.env.ADMIN_EMAIL||!process.env.ADMIN_PASSWORD||String(process.env.ADMIN_PASSWORD).length<12){console.error('ADMIN_EMAIL and an ADMIN_PASSWORD of at least 12 characters are required.');process.exit(1);}await mongoose.connect(process.env.MONGODB_URI);const email=String(process.env.ADMIN_EMAIL).trim().toLowerCase();const passwordHash=await bcrypt.hash(String(process.env.ADMIN_PASSWORD),12);await User.findOneAndUpdate({email},{$set:{name:process.env.ADMIN_NAME||'PracticeHub Admin',passwordHash,role:'coordinator',active:true}},{upsert:true,new:true,setDefaultsOnInsert:true});app.listen(port,()=>console.log(`PracticeHub API listening on ${port}`));}
+async function start(){if(!process.env.MONGODB_URI){console.error('MONGODB_URI is required. Copy .env.example to .env and configure credentials.');process.exit(1);}if(!process.env.ADMIN_EMAIL||!process.env.ADMIN_PASSWORD||String(process.env.ADMIN_PASSWORD).length<12){console.error('ADMIN_EMAIL and an ADMIN_PASSWORD of at least 12 characters are required.');process.exit(1);}await mongoose.connect(process.env.MONGODB_URI);const email=String(process.env.ADMIN_EMAIL).trim().toLowerCase();const passwordHash=await bcrypt.hash(String(process.env.ADMIN_PASSWORD),12);await User.findOneAndUpdate({email},{$set:{name:process.env.ADMIN_NAME||'PracticeHub Admin',passwordHash,role:'coordinator',active:true}},{upsert:true,new:true,setDefaultsOnInsert:true});leaderboardSockets=webSocketServer;httpServer.listen(port,()=>console.log(`PracticeHub API listening on ${port}`));}
 if(process.env.NODE_ENV!=='test')start().catch(e=>{console.error('Database connection failed:',e.message);process.exit(1);});
