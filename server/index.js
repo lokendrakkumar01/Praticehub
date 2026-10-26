@@ -27,7 +27,8 @@ app.use((req, res, next) => {
 });
 app.use(express.json({ limit: '1mb' }));
 const prod = process.env.NODE_ENV === 'production';
-app.use(session({ name: 'practicehub.sid', secret: process.env.SESSION_SECRET || 'local-dev-only-change-me', resave: false, saveUninitialized: false, cookie: { httpOnly: true, sameSite: prod ? 'none' : 'lax', secure: prod, maxAge: 1000 * 60 * 60 * 12 }, store: process.env.MONGODB_URI ? MongoStore.create({ mongoUrl: process.env.MONGODB_URI, collectionName: 'sessions', ttl: 60 * 60 * 12 }) : undefined }));
+const sessionTtlSeconds=60*60*24*30;
+app.use(session({ name: 'practicehub.sid', secret: process.env.SESSION_SECRET || 'local-dev-only-change-me', resave: false, saveUninitialized: false, rolling: true, cookie: { httpOnly: true, sameSite: prod ? 'none' : 'lax', secure: prod, maxAge: 1000 * sessionTtlSeconds }, store: process.env.MONGODB_URI ? MongoStore.create({ mongoUrl: process.env.MONGODB_URI, collectionName: 'sessions', ttl: sessionTtlSeconds }) : undefined }));
 const cloudinaryUrl = process.env.CLOUDINARY_URL;
 if (cloudinaryUrl) {
   const parsedCloudinaryUrl = new URL(cloudinaryUrl);
@@ -146,10 +147,14 @@ app.get('/api/records/:id/audit', auth, roles('coordinator','faculty'), async(re
 
 app.get('/api/leaderboard', auth, async(req,res)=>{try{
   const filter={...recordQuery};if(req.query.start&&req.query.end)filter.practiceDate=getWeek(req.query.start,req.query.end);if(['Aptitude','Mock Interview'].includes(req.query.module))filter.module=req.query.module;
-  const records=await PracticeRecord.find(filter).populate('student','fullName studentId batch').lean(),groups=new Map();
-  for(const r of records){if(!r.student)continue;const id=String(r.student._id);const x=groups.get(id)||{student:r.student,attempts:0,total:0,best:0,bestPoints:0,bestMaxScore:0,scoreTotal:0,maxScoreTotal:0,scales:new Set(),dates:[],last:null,apt:[],interview:[]};x.attempts++;x.total+=r.percentage;x.scoreTotal+=r.score;x.maxScoreTotal+=r.maxScore;x.scales.add(Number(r.maxScore));if(r.percentage>x.best){x.best=r.percentage;x.bestPoints=r.score;x.bestMaxScore=r.maxScore;}x.dates.push(r.practiceDate);x.last=!x.last||r.practiceDate>x.last?r.practiceDate:x.last;(r.module==='Aptitude'?x.apt:x.interview).push(r.percentage);groups.set(id,x);}
-  const rows=[...groups.values()].map(x=>({...x,average:Number((x.total/x.attempts).toFixed(1)),averagePoints:Number((x.scoreTotal/x.attempts).toFixed(1)),averageMaxScore:x.scales.size===1?[...x.scales][0]:null,consistency:new Set(x.dates.map(d=>new Date(d).toDateString())).size})).sort((a,b)=>b.average-a.average||b.attempts-a.attempts);
-  res.json(rows.map((x,i)=>({...x,rank:i+1,points:Math.round(x.average*x.attempts),scales:[...x.scales]})));
+  const rows=await PracticeRecord.aggregate([
+    {$match:filter},{$sort:{student:1,percentage:-1,practiceDate:-1}},
+    {$group:{_id:'$student',attempts:{$sum:1},total:{$sum:'$percentage'},scoreTotal:{$sum:'$score'},scales:{$addToSet:'$maxScore'},best:{$first:'$percentage'},bestPoints:{$first:'$score'},bestMaxScore:{$first:'$maxScore'},dates:{$addToSet:{$dateToString:{format:'%Y-%m-%d',date:'$practiceDate'}}},last:{$max:'$practiceDate'}}},
+    {$addFields:{average:{$round:[{$divide:['$total','$attempts']},1]},averagePoints:{$round:[{$divide:['$scoreTotal','$attempts']},1]},averageMaxScore:{$cond:[{$eq:[{$size:'$scales'},1]},{$arrayElemAt:['$scales',0]},null]},consistency:{$size:'$dates'}}},
+    {$lookup:{from:'students',localField:'_id',foreignField:'_id',as:'student'}},{$unwind:'$student'},
+    {$sort:{average:-1,attempts:-1}},{$project:{student:{_id:'$student._id',fullName:'$student.fullName',studentId:'$student.studentId',batch:'$student.batch',photoUrl:'$student.photoUrl'},attempts:1,average:1,averagePoints:1,averageMaxScore:1,best:1,bestPoints:1,bestMaxScore:1,consistency:1,last:1,dates:1}}
+  ]);
+  res.json(rows.map((row,index)=>({...row,rank:index+1,points:Math.round(row.average*row.attempts)})));
 }catch(e){fail(res,e);}});
 
 app.get('/api/competitions',auth,async(req,res)=>{try{res.json(await Competition.find().sort({startDate:-1}).lean());}catch(e){fail(res,e);}});
