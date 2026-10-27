@@ -9,7 +9,7 @@ import bcrypt from 'bcryptjs';
 import multer from 'multer';
 import { v2 as cloudinary } from 'cloudinary';
 import { Readable } from 'node:stream';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 import { parse } from 'csv-parse/sync';
 import { User, Student, PracticeRecord, Competition, WinnerApproval, AuditLog } from './models.js';
@@ -63,9 +63,10 @@ async function auth(req, res, next) {
   req.user = req.session.user;
   if (req.user.role === 'student') {
     try {
-      const active = await Student.exists({ _id: req.user.student, enrollmentStatus: 'Active' });
-      if (!active) {
-        return req.session.destroy(() => { res.clearCookie('practicehub.sid'); res.status(401).json({ error: 'This student account is no longer active' }); });
+      const student = await Student.findOne({ _id: req.user.student, enrollmentStatus: 'Active' }).select('authVersion').lean();
+      if (!student || Number(req.user.authVersion) !== Number(student.authVersion || 0)) {
+        const message = !student ? 'This student account is no longer active' : 'Your login expired after an account security change. Please sign in again.';
+        return req.session.destroy(() => { res.clearCookie('practicehub.sid'); res.status(401).json({ error: message }); });
       }
     } catch (error) { return fail(res, error); }
   }
@@ -76,27 +77,24 @@ function fail(res, error) { if (error?.code === 11000) return res.status(409).js
 function establishSession(req, user) { return new Promise((resolve, reject) => { req.session.regenerate(error => { if (error) return reject(error); req.session.user = user; req.session.save(saveError => saveError ? reject(saveError) : resolve(user)); }); }); }
 const recordQuery = { status: 'Published' };
 const getWeek = (start, end) => ({ $gte: new Date(start), $lte: new Date(`${end}T23:59:59.999Z`) });
+const createTemporaryPassword = () => randomBytes(6).toString('base64url');
+const publicStudent = student => { const value = student.toObject ? student.toObject() : { ...student }; delete value.passwordHash; return value; };
 
 app.get('/api/health', (_req, res) => res.json({ ok: true, database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected' }));
 app.post('/api/auth/login', async (req, res) => { try { const email = String(req.body.email || '').trim().toLowerCase(); const user = email === String(process.env.ADMIN_EMAIL || '').trim().toLowerCase() ? await User.findOne({ email, active: true, role: 'coordinator' }) : null; if (!user || !(await bcrypt.compare(String(req.body.password || ''), user.passwordHash))) return res.status(401).json({ error: 'Invalid email or password' }); const sessionUser = await establishSession(req, { id: user.id, name: user.name, email: user.email, role: user.role }); res.json({ user: sessionUser }); } catch (e) { fail(res, e); } });
-app.post('/api/auth/student-login', async (req, res) => { try { const name=String(req.body.name||'').trim(); const phone=String(req.body.phone||'').replace(/\D/g,''); if(name.length<2||name.length>120||phone.length<10||phone.length>15)return res.status(400).json({error:'Enter your full name and a valid phone number'}); let student=await Student.findOne({fullName:new RegExp(`^${escapeRegex(name)}$`,'i'),phone,enrollmentStatus:'Active'}); if(!student)return res.status(401).json({error:'Name and phone number did not match an active student'}); if(!student.accountActivatedAt){student.accountActivatedAt=new Date();await student.save();} student=student.toObject(); const sessionUser = await establishSession(req, { id:String(student._id),student:String(student._id),name:student.fullName,role:'student' }); res.json({user:sessionUser}); } catch(e){fail(res,e);} });
-app.post('/api/auth/student-register', async (req, res) => {
+app.post('/api/auth/student-login', async (req, res) => {
   try {
-    const name = String(req.body.name || '').trim(), phone = String(req.body.phone || '').replace(/\D/g, '');
-    if (name.length < 2 || name.length > 120 || phone.length < 10 || phone.length > 15) return res.status(400).json({ error: 'Enter your full name and a phone number with 10 to 15 digits' });
-    let student = await Student.findOne({ fullName: new RegExp(`^${escapeRegex(name)}$`, 'i'), phone });
-    if (student) {
-      if (student.enrollmentStatus !== 'Active') return res.status(403).json({ error: 'This student account is inactive. Contact the administrator.' });
-      if (student.accountActivatedAt || student.batch === 'Self-registered') return res.status(409).json({ error: 'This student account has already been created. Use Student login instead.' });
-      student = await Student.findOneAndUpdate({ _id: student._id, enrollmentStatus: 'Active', accountActivatedAt: { $exists: false } }, { $set: { accountActivatedAt: new Date() } }, { new: true });
-      if (!student) return res.status(409).json({ error: 'This student account has already been created. Use Student login instead.' });
-    } else {
-      const id = `SELF-${randomUUID()}`;
-      student = await Student.create({ studentId: id, fullName: name, rollNumber: id, batch: 'Self-registered', phone, accountActivatedAt: new Date(), enrollmentStatus: 'Active' });
-    }
-    const sessionUser = await establishSession(req, { id: String(student._id), student: String(student._id), name: student.fullName, role: 'student' });
-    res.status(201).json({ user: sessionUser });
+    const name = String(req.body.name || '').trim(), phone = String(req.body.phone || '').replace(/\D/g, ''), password = String(req.body.password || '');
+    if (name.length < 2 || name.length > 120 || phone.length < 10 || phone.length > 15 || password.length < 8 || Buffer.byteLength(password, 'utf8') > 72) return res.status(400).json({ error: 'Enter your name, valid phone number, and password' });
+    const student = await Student.findOne({ fullName: new RegExp(`^${escapeRegex(name)}$`, 'i'), phone, enrollmentStatus: 'Active' }).select('+passwordHash');
+    if (!student?.passwordHash || !(await bcrypt.compare(password, student.passwordHash))) return res.status(401).json({ error: 'Name, phone number, or password is incorrect. Ask the administrator for a temporary password if this is your first login.' });
+    if (!student.accountActivatedAt) { student.accountActivatedAt = new Date(); await student.save(); }
+    const sessionUser = await establishSession(req, { id: String(student._id), student: String(student._id), name: student.fullName, role: 'student', authVersion: Number(student.authVersion || 0) });
+    res.json({ user: sessionUser });
   } catch (e) { fail(res, e); }
+});
+app.post('/api/auth/student-register', async (req, res) => {
+  res.status(410).json({ error: 'Student self-registration is disabled. Ask the administrator to create your account and issue a temporary password.' });
 });
 app.post('/api/auth/logout', auth, (req, res) => {for(const client of webSocketServer.clients)if(client.sessionId===req.sessionID)client.close(1000,'Signed out');req.session.destroy(() => { res.clearCookie('practicehub.sid'); res.sendStatus(204); });});
 app.get('/api/auth/me', auth, (req, res) => res.json({ user: req.user }));
@@ -104,7 +102,9 @@ app.post('/api/auth/live-ticket',auth,(req,res)=>{for(const [key,value] of liveT
 app.post('/api/users', auth, roles('coordinator'), async (req, res) => { try { const { name, email, password, role } = req.body; if (!name || !email || !password || !['coordinator', 'faculty', 'student'].includes(role)) return res.status(400).json({ error: 'Name, email, password, and a valid role are required' }); const user = await User.create({ name, email: email.toLowerCase(), passwordHash: await bcrypt.hash(password, 12), role, student: req.body.student || undefined }); res.status(201).json({ id: user.id, name: user.name, email: user.email, role: user.role }); } catch (e) { fail(res, e); } });
 
 app.get('/api/students', auth, async (req, res) => { try { const page = Math.max(1, Number(req.query.page) || 1), limit = Math.min(100, Math.max(1, Number(req.query.limit) || 25)); const q = String(req.query.q || '').trim(); const filter = { ...(q ? { $or: [{ fullName: new RegExp(escapeRegex(q), 'i') }, { rollNumber: new RegExp(escapeRegex(q), 'i') }] } : {}), ...(req.query.status ? { enrollmentStatus: req.query.status } : {}) }; if (req.user.role === 'student') filter._id = req.user.student; const [rows, total] = await Promise.all([Student.find(filter).sort({ fullName: 1 }).skip((page - 1) * limit).limit(limit).lean(), Student.countDocuments(filter)]); res.json({ rows, total, page, pages: Math.ceil(total / limit) }); } catch (e) { fail(res, e); } });
-app.post('/api/students', auth, roles('coordinator'), async (req, res) => { try { const fullName=String(req.body.fullName||'').trim(); const phone=String(req.body.phone||'').replace(/\D/g,''); if(fullName.length<2||fullName.length>120||phone.length<10||phone.length>15)return res.status(400).json({error:'Enter a full name and a phone number with 10 to 15 digits'}); const duplicate=await Student.findOne({fullName:new RegExp(`^${escapeRegex(fullName)}$`,'i'),phone,enrollmentStatus:'Active'}); if(duplicate)return res.status(409).json({error:'This student is already in the directory. They can sign in with this name and phone number.'}); const id=`ADM-${randomUUID()}`; const student=await Student.create({studentId:id,fullName,rollNumber:id,batch:'Admin-added',phone,enrollmentStatus:'Active'}); res.status(201).json(student); } catch (e) { fail(res, e); } });
+app.post('/api/students', auth, roles('coordinator'), async (req, res) => { try { const fullName=String(req.body.fullName||'').trim(); const phone=String(req.body.phone||'').replace(/\D/g,''); if(fullName.length<2||fullName.length>120||phone.length<10||phone.length>15)return res.status(400).json({error:'Enter a full name and a phone number with 10 to 15 digits'}); const duplicate=await Student.findOne({fullName:new RegExp(`^${escapeRegex(fullName)}$`,'i'),phone,enrollmentStatus:'Active'}); if(duplicate)return res.status(409).json({error:'This student is already in the directory. Use the admin password reset to issue a new temporary password.'}); const id=`ADM-${randomUUID()}`,temporaryPassword=createTemporaryPassword(); const student=await Student.create({studentId:id,fullName,rollNumber:id,batch:'Admin-added',phone,passwordHash:await bcrypt.hash(temporaryPassword,12),enrollmentStatus:'Active'}); res.status(201).json({student:publicStudent(student),temporaryPassword}); } catch (e) { fail(res, e); } });
+app.post('/api/students/:id/reset-password', auth, roles('coordinator'), async (req, res) => { try { const student=await Student.findById(req.params.id); if(!student)return res.sendStatus(404); const temporaryPassword=createTemporaryPassword(); student.passwordHash=await bcrypt.hash(temporaryPassword,12); student.authVersion=Number(student.authVersion||0)+1; await student.save(); disconnectStudentSockets(String(student._id)); res.json({temporaryPassword}); } catch(e){fail(res,e);} });
+app.post('/api/students/me/change-password', auth, roles('student'), async (req, res) => { try { const currentPassword=String(req.body.currentPassword||''),newPassword=String(req.body.newPassword||''); if(Buffer.byteLength(newPassword,'utf8')<8||Buffer.byteLength(newPassword,'utf8')>72)return res.status(400).json({error:'New password must be 8 to 72 bytes long'}); const student=await Student.findById(req.user.student).select('+passwordHash'); if(!student?.passwordHash||!(await bcrypt.compare(currentPassword,student.passwordHash)))return res.status(401).json({error:'Current password is incorrect'}); student.passwordHash=await bcrypt.hash(newPassword,12); student.authVersion=Number(student.authVersion||0)+1; await student.save(); const user={id:String(student._id),student:String(student._id),name:student.fullName,role:'student',authVersion:student.authVersion}; const sessionUser=await establishSession(req,user); disconnectStudentSockets(String(student._id)); res.json({user:sessionUser}); } catch(e){fail(res,e);} });
 app.patch('/api/students/:id', auth, roles('coordinator'), async (req, res) => {
   try {
     const row = await Student.findById(req.params.id);
@@ -122,11 +122,13 @@ app.patch('/api/students/:id', auth, roles('coordinator'), async (req, res) => {
     if (duplicate && enrollmentStatus === 'Active') {
       return res.status(409).json({ error: 'Another active student already uses this name and phone number' });
     }
+    const credentialsChanged = row.fullName !== fullName || row.phone !== phone || enrollmentStatus !== 'Active';
     row.fullName = fullName;
     row.phone = phone;
     row.enrollmentStatus = enrollmentStatus;
+    if (credentialsChanged) row.authVersion = Number(row.authVersion || 0) + 1;
     await row.save();
-    if (enrollmentStatus !== 'Active') disconnectStudentSockets(String(row._id));
+    if (credentialsChanged) disconnectStudentSockets(String(row._id));
     broadcastLeaderboardUpdate();
     res.json(row);
   } catch (e) { fail(res, e); }
