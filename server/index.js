@@ -69,6 +69,14 @@ async function auth(req, res, next) {
         return req.session.destroy(() => { res.clearCookie('practicehub.sid'); res.status(401).json({ error: message }); });
       }
     } catch (error) { return fail(res, error); }
+  } else if (req.user.role === 'coordinator') {
+    try {
+      const user = await User.findOne({ _id: req.user.id, active: true, role: 'coordinator' }).select('authVersion').lean();
+      if (!user || Number(req.user.authVersion) !== Number(user.authVersion || 0)) {
+        const message = !user ? 'This administrator account is no longer active' : 'Your login expired after an account security change. Please sign in again.';
+        return req.session.destroy(() => { res.clearCookie('practicehub.sid'); res.status(401).json({ error: message }); });
+      }
+    } catch (error) { return fail(res, error); }
   }
   next();
 }
@@ -81,7 +89,7 @@ const createTemporaryPassword = () => randomBytes(6).toString('base64url');
 const publicStudent = student => { const value = student.toObject ? student.toObject() : { ...student }; delete value.passwordHash; return value; };
 
 app.get('/api/health', (_req, res) => res.json({ ok: true, database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected' }));
-app.post('/api/auth/login', async (req, res) => { try { const email = String(req.body.email || '').trim().toLowerCase(); const user = email === String(process.env.ADMIN_EMAIL || '').trim().toLowerCase() ? await User.findOne({ email, active: true, role: 'coordinator' }) : null; if (!user || !(await bcrypt.compare(String(req.body.password || ''), user.passwordHash))) return res.status(401).json({ error: 'Invalid email or password' }); const sessionUser = await establishSession(req, { id: user.id, name: user.name, email: user.email, role: user.role }); res.json({ user: sessionUser }); } catch (e) { fail(res, e); } });
+app.post('/api/auth/login', async (req, res) => { try { const email = String(req.body.email || '').trim().toLowerCase(); const user = email === String(process.env.ADMIN_EMAIL || '').trim().toLowerCase() ? await User.findOne({ email, active: true, role: 'coordinator' }) : null; if (!user || !(await bcrypt.compare(String(req.body.password || ''), user.passwordHash))) return res.status(401).json({ error: 'Invalid email or password' }); const sessionUser = await establishSession(req, { id: user.id, name: user.name, email: user.email, role: user.role, authVersion: Number(user.authVersion || 0) }); res.json({ user: sessionUser }); } catch (e) { fail(res, e); } });
 app.post('/api/auth/student-login', async (req, res) => {
   try {
     const name = String(req.body.name || '').trim(), phone = String(req.body.phone || '').replace(/\D/g, ''), password = String(req.body.password || '');
@@ -98,6 +106,19 @@ app.post('/api/auth/student-register', async (req, res) => {
 });
 app.post('/api/auth/logout', auth, (req, res) => {for(const client of webSocketServer.clients)if(client.sessionId===req.sessionID)client.close(1000,'Signed out');req.session.destroy(() => { res.clearCookie('practicehub.sid'); res.sendStatus(204); });});
 app.get('/api/auth/me', auth, (req, res) => res.json({ user: req.user }));
+app.post('/api/auth/change-password', auth, roles('coordinator'), async (req, res) => {
+  try {
+    const currentPassword = String(req.body.currentPassword || ''), newPassword = String(req.body.newPassword || '');
+    if (Buffer.byteLength(newPassword, 'utf8') < 8 || Buffer.byteLength(newPassword, 'utf8') > 72) return res.status(400).json({ error: 'New password must be 8 to 72 bytes long' });
+    const user = await User.findOne({ _id: req.user.id, role: 'coordinator', active: true });
+    if (!user || !(await bcrypt.compare(currentPassword, user.passwordHash))) return res.status(401).json({ error: 'Current password is incorrect' });
+    user.passwordHash = await bcrypt.hash(newPassword, 12);
+    user.authVersion = Number(user.authVersion || 0) + 1;
+    await user.save();
+    const sessionUser = await establishSession(req, { id: user.id, name: user.name, email: user.email, role: user.role, authVersion: user.authVersion });
+    res.json({ user: sessionUser });
+  } catch (e) { fail(res, e); }
+});
 app.post('/api/auth/live-ticket',auth,(req,res)=>{for(const [key,value] of liveTickets)if(value.expiresAt<Date.now())liveTickets.delete(key);const ticket=randomUUID();liveTickets.set(ticket,{sessionId:req.sessionID,studentId:req.user.role==='student'?String(req.user.student):null,expiresAt:Date.now()+30000});res.json({ticket});});
 app.post('/api/users', auth, roles('coordinator'), async (req, res) => { try { const { name, email, password, role } = req.body; if (!name || !email || !password || !['coordinator', 'faculty', 'student'].includes(role)) return res.status(400).json({ error: 'Name, email, password, and a valid role are required' }); const user = await User.create({ name, email: email.toLowerCase(), passwordHash: await bcrypt.hash(password, 12), role, student: req.body.student || undefined }); res.status(201).json({ id: user.id, name: user.name, email: user.email, role: user.role }); } catch (e) { fail(res, e); } });
 
@@ -255,5 +276,5 @@ app.use((error, _req, res, _next) => {
 
 function escapeRegex(s){return s.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');}
 function csvCell(v){return `"${String(v??'').replaceAll('"','""')}"`;}
-async function start(){if(!process.env.MONGODB_URI){console.error('MONGODB_URI is required. Copy .env.example to .env and configure credentials.');process.exit(1);}if(!process.env.ADMIN_EMAIL||!process.env.ADMIN_PASSWORD||String(process.env.ADMIN_PASSWORD).length<12){console.error('ADMIN_EMAIL and an ADMIN_PASSWORD of at least 12 characters are required.');process.exit(1);}await mongoose.connect(process.env.MONGODB_URI);const email=String(process.env.ADMIN_EMAIL).trim().toLowerCase();const passwordHash=await bcrypt.hash(String(process.env.ADMIN_PASSWORD),12);await User.findOneAndUpdate({email},{$set:{name:process.env.ADMIN_NAME||'PracticeHub Admin',passwordHash,role:'coordinator',active:true}},{upsert:true,new:true,setDefaultsOnInsert:true});leaderboardSockets=webSocketServer;httpServer.listen(port,()=>console.log(`PracticeHub API listening on ${port}`));}
+async function start(){if(!process.env.MONGODB_URI){console.error('MONGODB_URI is required. Copy .env.example to .env and configure credentials.');process.exit(1);}if(!process.env.ADMIN_EMAIL||!process.env.ADMIN_PASSWORD||String(process.env.ADMIN_PASSWORD).length<12){console.error('ADMIN_EMAIL and an ADMIN_PASSWORD of at least 12 characters are required.');process.exit(1);}await mongoose.connect(process.env.MONGODB_URI);const email=String(process.env.ADMIN_EMAIL).trim().toLowerCase();const passwordHash=await bcrypt.hash(String(process.env.ADMIN_PASSWORD),12);await User.findOneAndUpdate({email},{$setOnInsert:{name:process.env.ADMIN_NAME||'PracticeHub Admin',passwordHash,role:'coordinator',active:true}},{upsert:true,new:true,setDefaultsOnInsert:true});leaderboardSockets=webSocketServer;httpServer.listen(port,()=>console.log(`PracticeHub API listening on ${port}`));}
 if(process.env.NODE_ENV!=='test')start().catch(e=>{console.error('Database connection failed:',e.message);process.exit(1);});
