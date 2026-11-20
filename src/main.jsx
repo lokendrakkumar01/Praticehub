@@ -9,7 +9,9 @@ const seed = [];
 const chart = [];
 const navGroups=[{title:'OVERVIEW',items:[['Dashboard',LayoutDashboard],['Leaderboard',Trophy],['Student Directory',Users]]},{title:'PRACTICE',items:[['Add Practice Record',Plus],['Practice History',Clock3],['Practice Center',BookOpen]]},{title:'INSIGHTS',items:[['Weekly Champions',Award],['Faculty Reports',BarChart3]]}];
 const studentNavGroups=[{title:'MY PRACTICE',items:[['Dashboard',LayoutDashboard],['My Scores',BarChart3],['Leaderboard',Trophy],['Practice Center',BookOpen]]}];
-const API=(import.meta.env.VITE_API_URL||'https://practicehub-api.onrender.com/api').replace(/\/$/,'');
+const LIVE_API='https://praticehub.onrender.com/api';
+const configuredApi=(import.meta.env.VITE_API_URL||'').replace(/\/$/,'');
+const API=!configuredApi||configuredApi==='https://practicehub-api.onrender.com/api'?LIVE_API:configuredApi;
 async function api(path,options={}){
  const {timeoutMs=45000,retries=2,...requestOptions}=options,isRead=(requestOptions.method||'GET').toUpperCase()==='GET';let lastError;
  for(let attempt=0;attempt<(isRead?Math.max(1,retries):1);attempt++){
