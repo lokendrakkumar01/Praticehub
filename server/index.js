@@ -21,18 +21,29 @@ let leaderboardSockets;
 const webSocketServer = new WebSocketServer({ noServer: true, maxPayload: 1024 });
 function broadcastLeaderboardUpdate(){if(!leaderboardSockets)return;const message=JSON.stringify({type:'leaderboard:update',updatedAt:Date.now()});for(const client of leaderboardSockets.clients)if(client.readyState===WebSocket.OPEN)client.send(message);}
 function disconnectStudentSockets(studentId){for(const [key,ticket] of liveTickets)if(ticket.studentId===studentId)liveTickets.delete(key);for(const client of webSocketServer.clients)if(client.studentId===studentId)client.close(1000,'Student account is no longer active');}
-httpServer.on('upgrade',(req,socket,head)=>{let url;try{url=new URL(req.url,'http://localhost');}catch{socket.destroy();return;}if(url.pathname!=='/api/live'){socket.destroy();return;}const origin=req.headers.origin;if(origin&&!allowedOrigins.includes(origin)){socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');socket.destroy();return;}const ticket=url.searchParams.get('ticket'),session=liveTickets.get(ticket);if(!session||session.expiresAt<Date.now()){if(ticket)liveTickets.delete(ticket);socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');socket.destroy();return;}liveTickets.delete(ticket);webSocketServer.handleUpgrade(req,socket,head,ws=>{ws.sessionId=session.sessionId;ws.studentId=session.studentId;webSocketServer.emit('connection',ws,req);});});
+httpServer.on('upgrade',(req,socket,head)=>{let url;try{url=new URL(req.url,'http://localhost');}catch{socket.destroy();return;}if(url.pathname!=='/api/live'){socket.destroy();return;}const origin=req.headers.origin;if(origin){let normalizedOrigin;try{normalizedOrigin=new URL(origin).origin;}catch{socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');socket.destroy();return;}if(!allowedOrigins.includes(normalizedOrigin)){socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');socket.destroy();return;}}const ticket=url.searchParams.get('ticket'),session=liveTickets.get(ticket);if(!session||session.expiresAt<Date.now()){if(ticket)liveTickets.delete(ticket);socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');socket.destroy();return;}liveTickets.delete(ticket);webSocketServer.handleUpgrade(req,socket,head,ws=>{ws.sessionId=session.sessionId;ws.studentId=session.studentId;webSocketServer.emit('connection',ws,req);});});
 webSocketServer.on('connection',ws=>{ws.isAlive=true;ws.on('pong',()=>{ws.isAlive=true;});});
 setInterval(()=>{for(const client of webSocketServer.clients){if(!client.isAlive){client.terminate();continue;}client.isAlive=false;client.ping();}},30000).unref();
 const port = Number(process.env.PORT || 4000);
-const allowedOrigins = (process.env.APP_ORIGIN || 'http://localhost:5173').split(',').map(x => x.trim());
+const configuredOrigins = (process.env.APP_ORIGIN || '').split(',').map(value => {
+  try { return new URL(value.trim()).origin; } catch { return null; }
+}).filter(Boolean);
+const defaultAppOrigin = process.env.NODE_ENV === 'production' ? 'https://practicehub-y8qd.onrender.com' : 'http://localhost:5173';
+const allowedOrigins = [...new Set([defaultAppOrigin, ...configuredOrigins])];
 app.disable('x-powered-by');
 // Render terminates TLS at its proxy; trust it so Express can issue Secure cookies.
 if (process.env.NODE_ENV === 'production') app.set('trust proxy', 1);
 app.use(helmet());
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  if (origin && allowedOrigins.includes(origin)) { res.setHeader('Access-Control-Allow-Origin', origin); res.setHeader('Access-Control-Allow-Credentials', 'true'); }
+  if (origin) {
+    let normalizedOrigin;
+    try { normalizedOrigin = new URL(origin).origin; } catch { return res.sendStatus(403); }
+    if (!allowedOrigins.includes(normalizedOrigin)) return res.sendStatus(403);
+    res.vary('Origin');
+    res.setHeader('Access-Control-Allow-Origin', normalizedOrigin);
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+  }
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type'); res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PATCH,DELETE,OPTIONS');
   if (req.method === 'OPTIONS') return res.sendStatus(204); next();
 });

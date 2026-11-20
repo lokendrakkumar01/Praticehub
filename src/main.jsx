@@ -10,7 +10,22 @@ const chart = [];
 const navGroups=[{title:'OVERVIEW',items:[['Dashboard',LayoutDashboard],['Leaderboard',Trophy],['Student Directory',Users]]},{title:'PRACTICE',items:[['Add Practice Record',Plus],['Practice History',Clock3],['Practice Center',BookOpen]]},{title:'INSIGHTS',items:[['Weekly Champions',Award],['Faculty Reports',BarChart3]]}];
 const studentNavGroups=[{title:'MY PRACTICE',items:[['Dashboard',LayoutDashboard],['My Scores',BarChart3],['Leaderboard',Trophy],['Practice Center',BookOpen]]}];
 const API=(import.meta.env.VITE_API_URL||'https://practicehub-api.onrender.com/api').replace(/\/$/,'');
-async function api(path,options={}){const {timeoutMs=45000,...requestOptions}=options,isRead=(requestOptions.method||'GET').toUpperCase()==='GET';let lastError;for(let attempt=0;attempt<(isRead?2:1);attempt++){const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),timeoutMs);try{const response=await fetch(`${API}${path}`,{credentials:'include',...requestOptions,signal:requestOptions.signal||controller.signal,headers:{...(requestOptions.body&&!(requestOptions.body instanceof FormData)?{'Content-Type':'application/json'}:{}),...(requestOptions.headers||{})}});const data=response.status===204?null:await response.json().catch(()=>null);if(!response.ok){const error=new Error(data?.error||`Request failed (${response.status})`);error.status=response.status;if(isRead&&attempt===0&&[502,503,504].includes(response.status)){lastError=error;await new Promise(resolve=>setTimeout(resolve,1000));continue;}throw error;}return data;}catch(error){lastError=error;if(!isRead||attempt>0||(error.status&&![502,503,504].includes(error.status)))break;await new Promise(resolve=>setTimeout(resolve,1200));}finally{clearTimeout(timeout);}}if(lastError?.name==='AbortError')throw new Error('The server is taking longer than usual to respond. It may be waking up; please try again.');if(lastError&&!lastError.status)throw new Error('Could not reach the PracticeHub server. Check your connection and try again.');throw lastError||new Error('Request failed. Please try again.');}
+async function api(path,options={}){
+ const {timeoutMs=45000,retries=2,...requestOptions}=options,isRead=(requestOptions.method||'GET').toUpperCase()==='GET';let lastError;
+ for(let attempt=0;attempt<(isRead?Math.max(1,retries):1);attempt++){
+  const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),timeoutMs);
+  try{
+   const response=await fetch(`${API}${path}`,{credentials:'include',...requestOptions,signal:requestOptions.signal||controller.signal,headers:{...(requestOptions.body&&!(requestOptions.body instanceof FormData)?{'Content-Type':'application/json'}:{}),...(requestOptions.headers||{})}});
+   const data=response.status===204?null:await response.json().catch(()=>null);
+   if(!response.ok){const error=new Error(data?.error||`Request failed (${response.status})`);error.status=response.status;lastError=error;if(isRead&&attempt+1<Math.max(1,retries)&&[502,503,504].includes(response.status)){await new Promise(resolve=>setTimeout(resolve,900));continue;}throw error;}
+   return data;
+  }catch(error){lastError=error;if(!isRead||attempt+1>=Math.max(1,retries)||(error.status&&![502,503,504].includes(error.status)))break;await new Promise(resolve=>setTimeout(resolve,900));}
+  finally{clearTimeout(timeout);}
+ }
+ if(lastError?.name==='AbortError')throw new Error('The server is taking longer than usual to respond. It may be waking up; please try again.');
+ if(lastError&&!lastError.status)throw new Error('Could not reach the PracticeHub server. Check your connection and try again.');
+ throw lastError||new Error('Request failed. Please try again.');
+}
 function scoreDisplay(record){return `${Number(record.score)}/${Number(record.maxScore)||50}`;}
 function localDateKey(date){return `${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,'0')}-${String(date.getDate()).padStart(2,'0')}`;}
 function practiceDateKey(value){return String(value||'').slice(0,10);}
@@ -235,15 +250,24 @@ function StudentDirectory(){
 }
 function AdminAccountSettings({auth,onAuthUpdate}){const[error,setError]=useState(''),[message,setMessage]=useState(''),[busy,setBusy]=useState(false);async function submit(e){e.preventDefault();const form=e.currentTarget,fields=Object.fromEntries(new FormData(form).entries());setError('');setMessage('');if(fields.newPassword!==fields.confirmPassword){setError('New passwords do not match.');return;}setBusy(true);try{const result=await api('/auth/change-password',{method:'POST',body:JSON.stringify(fields)});onAuthUpdate(result.user);form.reset();setMessage('Admin password changed successfully. Keep your new password private.');}catch(err){setError(err.message);}finally{setBusy(false);}}return <section className="card account-settings"><div className="account-settings-icon"><KeyRound size={20}/></div><div className="account-settings-heading"><h3>Change admin password</h3><p>Update the password used to sign in as {auth.email||auth.name}. Your current password is required.</p></div><form className="admin-password-form" onSubmit={submit}><label>Current password<input name="currentPassword" type="password" required autoComplete="current-password"/></label><label>New password<input name="newPassword" type="password" required minLength="8" maxLength="72" autoComplete="new-password"/><small>Use 8–72 characters.</small></label><label>Confirm new password<input name="confirmPassword" type="password" required minLength="8" maxLength="72" autoComplete="new-password"/></label>{error&&<div className="inline-error" role="alert">{error}</div>}{message&&<div className="inline-success" role="status">{message}</div>}<button className="btn btn-primary" disabled={busy}>{busy?'Updating…':'Update admin password'}</button></form></section>}
 function LoginGate(){
- const[path,setPath]=useState(location.pathname.toLowerCase()),[auth,setAuth]=useState(null),[connectionSlow,setConnectionSlow]=useState(false),authRequest=useRef(0);
- useEffect(()=>{let cancelled=false;const timer=setTimeout(()=>{if(!cancelled)setConnectionSlow(true);},7000);
-  api('/health',{timeoutMs:8000}).catch(()=>{if(!cancelled)setConnectionSlow(true);});
-  api('/auth/me',{timeoutMs:8000}).then(data=>{if(!cancelled&&authRequest.current===0){setAuth(data.user);setConnectionSlow(false);}}).catch(error=>{if(!cancelled)setConnectionSlow(error.status!==401);}).finally(()=>{clearTimeout(timer);});
-  const pop=()=>setPath(location.pathname.toLowerCase());addEventListener('popstate',pop);return()=>{cancelled=true;clearTimeout(timer);removeEventListener('popstate',pop);};
- },[]);
+ const[path,setPath]=useState(location.pathname.toLowerCase()),[auth,setAuth]=useState(null),[connectionSlow,setConnectionSlow]=useState(false),[retryCount,setRetryCount]=useState(0),authRequest=useRef(0);
+ useEffect(()=>{
+  let cancelled=false,retryTimer;const wakeTimer=setTimeout(()=>{if(!cancelled)setConnectionSlow(true);},7000);
+  api('/health',{timeoutMs:12000,retries:1}).catch(()=>{if(!cancelled)setConnectionSlow(true);});
+  async function restoreSession(){
+   const deadline=Date.now()+120000;
+   while(!cancelled&&authRequest.current===0&&Date.now()<deadline){
+    try{const data=await api('/auth/me',{timeoutMs:15000,retries:1});if(!cancelled&&authRequest.current===0){setAuth(data.user);setConnectionSlow(false);}return;}
+    catch(error){if(cancelled||authRequest.current!==0)return;if(error.status===401){setConnectionSlow(false);return;}setConnectionSlow(true);await new Promise(resolve=>{retryTimer=setTimeout(resolve,1500);});}
+   }
+   if(!cancelled&&authRequest.current===0)setConnectionSlow(true);
+  }
+  restoreSession();const pop=()=>setPath(location.pathname.toLowerCase());addEventListener('popstate',pop);
+  return()=>{cancelled=true;clearTimeout(wakeTimer);clearTimeout(retryTimer);removeEventListener('popstate',pop);};
+ },[retryCount]);
  function go(path){history.pushState({},'',path);setPath(path.toLowerCase());}
  function signIn(user){if(!user)throw new Error('The server did not return a signed-in account. Please try again.');authRequest.current++;setAuth(user);setConnectionSlow(false);go('/');}
- async function retryConnection(){setConnectionSlow(false);try{const data=await api('/auth/me',{timeoutMs:120000});setAuth(data.user);}catch(error){if(error.status!==401)setConnectionSlow(true);}}
+ function retryConnection(){setRetryCount(value=>value+1);setConnectionSlow(false);}
  async function logout(){try{await api('/auth/logout',{method:'POST'});}catch{}authRequest.current++;setAuth(null);go('/login');}
  if(auth)return auth.role==='coordinator'?<AdminWorkspace auth={auth} onLogout={logout} onAuthUpdate={setAuth}/>:<StudentWorkspace auth={auth} onLogout={logout} onAuthUpdate={setAuth}/>;
  const mode=path.includes('/admin/login')?'admin':path.includes('/student/register')?'student-register':path.includes('/student/login')?'student':'choose';

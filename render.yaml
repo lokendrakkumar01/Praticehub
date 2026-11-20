@@ -20,7 +20,7 @@ services:
       - key: ADMIN_NAME
         value: PracticeHub Admin
       - key: APP_ORIGIN
-        sync: false
+        value: https://practicehub-y8qd.onrender.com
       - key: CLOUDINARY_URL
         sync: false
 
